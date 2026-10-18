@@ -30,7 +30,7 @@ async def run_stream(dut, seed: int, p_src: float, p_snk: float, n_packets: int 
     assert snk.empty()
 
 
-@cocotb.test()
+@cocotb.test(timeout_time=1, timeout_unit="ms")
 async def skid_full_throughput(dut):
     """With no stalls the skid buffer must pass one beat per clock."""
     await start(dut)
@@ -44,11 +44,11 @@ async def skid_full_throughput(dut):
     assert cycles < 256 + 10, f"took {cycles:.0f} cycles for 256 beats"
 
 
-@cocotb.test()
+@cocotb.test(timeout_time=3, timeout_unit="ms")
 async def random_backpressure_light(dut):
     await run_stream(dut, seed=1, p_src=0.1, p_snk=0.1)
 
 
-@cocotb.test()
+@cocotb.test(timeout_time=3, timeout_unit="ms")
 async def random_backpressure_heavy(dut):
     await run_stream(dut, seed=2, p_src=0.5, p_snk=0.7, n_packets=3000)
