@@ -12,7 +12,7 @@ synthesised and timed in Vivado for an Artix-7.
 | Phase | Scope | Status |
 | --- | --- | --- |
 | 0 | Makefile, Verilator lint, cocotb runner, CI, Vivado batch flow | done |
-| 1 | AXI-Stream skid buffer and FIFO, random-backpressure tests, protocol checker | |
+| 1 | AXI-Stream skid buffer and FIFO, random-backpressure tests, protocol checker | done |
 | 2 | Ethernet/IPv4/UDP receive: filters, header checksum, 2-byte realignment | |
 | 3 | MoldUDP64 framer: message splitting across beats, sequence gaps | |
 | 4 | ITCH 5.0 decoder and symbol filter | |
