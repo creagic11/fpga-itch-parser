@@ -28,6 +28,7 @@ BENCHES = {
     "udp_rx":    ("udp_rx_top",     "test_udp_rx",      ["axis_skid.sv", "eth_ip_udp_rx.sv",
                                                          "realign.sv", "udp_rx_top.sv"]),
     "mold":      ("mold_framer",    "test_mold_framer", ["mold_framer.sv"]),
+    "book":      ("book_engine",    "test_book_engine", ["book_engine.sv"]),
     "itch_rx":   ("itch_rx_top",    "test_itch_rx",     ["axis_skid.sv", "axis_fifo.sv",
                                                          "eth_ip_udp_rx.sv", "realign.sv",
                                                          "udp_rx_top.sv", "mold_framer.sv",
