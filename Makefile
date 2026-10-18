@@ -4,7 +4,7 @@
 # make clean
 
 PY    ?= python3
-TOPS  ?= itch_rx_top book_engine
+TOPS  ?= itch_book_top
 RTL   := $(wildcard rtl/*.sv)
 
 .PHONY: test lint syn clean

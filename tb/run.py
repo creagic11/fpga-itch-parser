@@ -29,6 +29,11 @@ BENCHES = {
                                                          "realign.sv", "udp_rx_top.sv"]),
     "mold":      ("mold_framer",    "test_mold_framer", ["mold_framer.sv"]),
     "book":      ("book_engine",    "test_book_engine", ["book_engine.sv"]),
+    "itch_book": ("itch_book_top",  "test_itch_book",   ["axis_skid.sv", "axis_fifo.sv",
+                                                         "eth_ip_udp_rx.sv", "realign.sv",
+                                                         "udp_rx_top.sv", "mold_framer.sv",
+                                                         "itch_decode.sv", "itch_rx_top.sv",
+                                                         "book_engine.sv", "itch_book_top.sv"]),
     "itch_rx":   ("itch_rx_top",    "test_itch_rx",     ["axis_skid.sv", "axis_fifo.sv",
                                                          "eth_ip_udp_rx.sv", "realign.sv",
                                                          "udp_rx_top.sv", "mold_framer.sv",
@@ -57,7 +62,8 @@ def run(name: str) -> bool:
     runner.test(hdl_toplevel=top, test_module=module, test_dir=str(TB), build_dir=str(build_dir),
                 results_xml=str(results), waves=waves,
                 extra_env={"PYTHONPATH": str(TB),
-                           **{k: v for k, v in os.environ.items() if k.startswith("ITCH_")}})
+                           **{k: v for k, v in os.environ.items()
+                              if k.startswith("ITCH_") or k == "LATENCY_OUT"}})
     tree = ET.parse(results)
     failures = [tc.get("name") for tc in tree.iter("testcase") if tc.find("failure") is not None]
     total = sum(1 for _ in tree.iter("testcase"))

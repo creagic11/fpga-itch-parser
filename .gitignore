@@ -6,6 +6,8 @@ __pycache__/
 *.vcd
 syn/out/
 .Xil/
+usage_statistics_webtalk.*
+vivado*.backup.*
 *.jou
 *.log
 !syn/reports/*.rpt

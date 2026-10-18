@@ -9,7 +9,7 @@
 
 set script_dir [file dirname [file normalize [info script]]]
 set root       [file dirname $script_dir]
-set top  [expr {[llength $argv] > 0 ? [lindex $argv 0] : "udp_rx_top"}]
+set top  [expr {[llength $argv] > 0 ? [lindex $argv 0] : "itch_book_top"}]
 set part [expr {[llength $argv] > 1 ? [lindex $argv 1] : "xc7a100tcsg324-1"}]
 set out  [file join $root syn out]
 set rpt  [file join $root syn reports]
