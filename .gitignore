@@ -1,0 +1,15 @@
+sim_build/
+results.xml
+__pycache__/
+*.pyc
+*.fst
+*.vcd
+syn/out/
+.Xil/
+*.jou
+*.log
+!syn/reports/*.rpt
+# Real Nasdaq data and large captures stay local
+/data/
+*.pcap
+!tb/data/*.pcap

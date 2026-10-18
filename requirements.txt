@@ -1,0 +1,3 @@
+cocotb==1.9.2
+cocotbext-axi==0.1.28
+scapy==2.6.1
