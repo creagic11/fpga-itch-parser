@@ -4,7 +4,7 @@
 # make clean
 
 PY    ?= python3
-TOPS  ?= udp_rx_top axis_fifo
+TOPS  ?= udp_rx_top mold_framer axis_fifo
 RTL   := $(wildcard rtl/*.sv)
 
 .PHONY: test lint syn clean

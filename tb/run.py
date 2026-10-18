@@ -27,6 +27,7 @@ BENCHES = {
     "axis_fifo": ("wrap_axis_fifo", "test_axis_basics", ["axis_fifo.sv"]),
     "udp_rx":    ("udp_rx_top",     "test_udp_rx",      ["axis_skid.sv", "eth_ip_udp_rx.sv",
                                                          "realign.sv", "udp_rx_top.sv"]),
+    "mold":      ("mold_framer",    "test_mold_framer", ["mold_framer.sv"]),
 }
 
 
