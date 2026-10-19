@@ -1,0 +1,18 @@
+module instance                            WNS (ns)  levels  worst path start -> end
+u_book                                        0.178       1  u_book/bm_word_ask_reg[41]/C -> u_book/bm_ask_reg[2628]/D
+u_book/g_way[0].u_ram                         0.755       0  u_book/g_way[3].u_ram/g_rreg.raddr_i_reg[7]_rep/C -> u_book/g_way[0].u_ram/mem_reg_8/ADDRBWRADDR[10]
+u_book/g_way[1].u_ram                         0.930       0  u_book/g_way[1].u_ram/g_ireg.we_i_reg/C -> u_book/g_way[1].u_ram/mem_reg_2/ENARDEN
+u_book/g_way[2].u_ram                         1.221       0  u_book/g_way[3].u_ram/g_rreg.raddr_i_reg[4]_rep/C -> u_book/g_way[2].u_ram/mem_reg_4/ADDRBWRADDR[7]
+u_book/g_way[3].u_ram                         0.543       0  u_book/g_way[3].u_ram/g_ireg.we_i_reg/C -> u_book/g_way[3].u_ram/mem_reg_2/ENARDEN
+u_book/u_lvl_ask                              1.554       0  u_book/u_lvl_bid/g_ireg.waddr_i_reg[8]/C -> u_book/u_lvl_ask/mem_reg_0/ADDRARDADDR[11]
+u_book/u_lvl_bid                              1.126       1  u_book/state_reg[3]/C -> u_book/u_lvl_bid/g_ireg.wdata_i_reg[5]/R
+u_rx                                          0.141       6  u_rx/u_mold/rd_ptr_reg[1]_rep/C -> u_rx/u_mold/nb2_q_reg[1]/D
+u_rx/u_dec                                    0.624       6  u_rx/u_dec/d_len_reg[5]/C -> u_rx/u_dec/ev_new_ref_reg[54]/CE
+u_rx/u_fifo                                   1.812       3  u_rx/u_fifo/wr_ptr_reg[3]/C -> u_rx/u_fifo/mem_reg_1/ENARDEN
+u_rx/u_fskid                                  1.496       0  u_rx/u_fifo/mem_reg_0/CLKARDCLK -> u_rx/u_fskid/skid_q_reg[64]/D
+u_rx/u_mold                                   0.141       6  u_rx/u_mold/rd_ptr_reg[1]_rep/C -> u_rx/u_mold/nb2_q_reg[1]/D
+u_rx/u_skid                                   0.931       3  u_book/state_reg[0]/C -> u_rx/u_skid/skid_q_reg[74]/CE
+u_rx/u_udp                                    0.466       7  u_rx/u_udp/u_rx/csum_acc_reg[16]/C -> u_rx/u_udp/u_rx/csum_ok_q_reg/D
+u_rx/u_udp/u_realign                          1.180       3  u_rx/u_udp/u_skid/main_q_reg[68]/C -> u_rx/u_udp/u_realign/m_axis_tdata_reg[32]/CE
+u_rx/u_udp/u_rx                               0.466       7  u_rx/u_udp/u_rx/csum_acc_reg[16]/C -> u_rx/u_udp/u_rx/csum_ok_q_reg/D
+u_rx/u_udp/u_skid                             1.315       4  u_rx/u_udp/u_rx/first_fwd_reg/C -> u_rx/u_udp/u_skid/skid_q_reg[71]/D

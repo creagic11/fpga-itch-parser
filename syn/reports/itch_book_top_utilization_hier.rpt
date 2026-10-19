@@ -1,0 +1,47 @@
+Copyright 1986-2022 Xilinx, Inc. All Rights Reserved. Copyright 2022-2024 Advanced Micro Devices, Inc. All Rights Reserved.
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+| Tool Version : Vivado v.2024.1 (win64) Build 5076996 Wed May 22 18:37:14 MDT 2024
+| Date         : Mon Oct 19 20:34:19 2026
+| Host         : LAPTOP-GFP075F7 running 64-bit major release  (build 9200)
+| Command      : report_utilization -hierarchical -file C:/Users/Anubhav/OneDrive/Documents/itch/fpga-itch-parser-v6/fpga-itch-parser/syn/reports/itch_book_top_utilization_hier.rpt
+| Design       : itch_book_top
+| Device       : xc7a100tcsg324-1
+| Speed File   : -1
+| Design State : Physopt postRoute
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Utilization Design Information
+
+Table of Contents
+-----------------
+1. Utilization by Hierarchy
+
+1. Utilization by Hierarchy
+---------------------------
+
++--------------------+---------------------------+------------+------------+---------+------+-------+--------+--------+------------+
+|      Instance      |           Module          | Total LUTs | Logic LUTs | LUTRAMs | SRLs |  FFs  | RAMB36 | RAMB18 | DSP Blocks |
++--------------------+---------------------------+------------+------------+---------+------+-------+--------+--------+------------+
+| itch_book_top      |                     (top) |      16365 |      16365 |       0 |    0 | 13373 |     47 |      3 |          1 |
+|   u_book           |               book_engine |      14021 |      14021 |       0 |    0 | 10890 |     46 |      2 |          1 |
+|     (u_book)       |               book_engine |      13579 |      13579 |       0 |    0 | 10632 |      0 |      0 |          1 |
+|     g_way[0].u_ram |                   sdp_ram |         14 |         14 |       0 |    0 |     1 |      9 |      0 |          0 |
+|     g_way[1].u_ram |                 sdp_ram_1 |         14 |         14 |       0 |    0 |     1 |      9 |      0 |          0 |
+|     g_way[2].u_ram |                 sdp_ram_2 |         14 |         14 |       0 |    0 |     1 |      9 |      0 |          0 |
+|     g_way[3].u_ram |                 sdp_ram_3 |        178 |        178 |       0 |    0 |   127 |      9 |      0 |          0 |
+|     u_lvl_ask      |   sdp_ram__parameterized0 |        154 |        154 |       0 |    0 |    55 |      5 |      1 |          0 |
+|     u_lvl_bid      | sdp_ram__parameterized0_4 |        118 |        118 |       0 |    0 |    73 |      5 |      1 |          0 |
+|   u_rx             |               itch_rx_top |       2345 |       2345 |       0 |    0 |  2483 |      1 |      1 |          0 |
+|     u_dec          |               itch_decode |        199 |        199 |       0 |    0 |   642 |      0 |      0 |          0 |
+|     u_fifo         |                 axis_fifo |         24 |         24 |       0 |    0 |    16 |      1 |      1 |          0 |
+|     u_fskid        |                 axis_skid |        163 |        163 |       0 |    0 |   150 |      0 |      0 |          0 |
+|     u_mold         |               mold_framer |       1465 |       1465 |       0 |    0 |   941 |      0 |      0 |          0 |
+|     u_skid         | axis_skid__parameterized0 |        100 |        100 |       0 |    0 |   278 |      0 |      0 |          0 |
+|     u_udp          |                udp_rx_top |        397 |        397 |       0 |    0 |   456 |      0 |      0 |          0 |
+|       u_realign    |                   realign |         67 |         67 |       0 |    0 |   132 |      0 |      0 |          0 |
+|       u_rx         |             eth_ip_udp_rx |        281 |        281 |       0 |    0 |   174 |      0 |      0 |          0 |
+|       u_skid       |               axis_skid_0 |         50 |         50 |       0 |    0 |   150 |      0 |      0 |          0 |
++--------------------+---------------------------+------------+------------+---------+------+-------+--------+--------+------------+
+* Note: The sum of lower-level cells may be larger than their parent cells total, due to cross-hierarchy LUT combining
+
+

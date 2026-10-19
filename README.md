@@ -5,7 +5,7 @@ data (over MoldUDP64) and maintains the best bid and offer of a stock in hardwar
 AXI-Stream at 156.25 MHz (the 10 Gb/s datapath), verified in cocotb against a C++ golden model,
 synthesised and timed in Vivado for an Artix-7.
 
-> Work in progress, built phase by phase. Simulation and Vivado reports only: no board.
+> Simulation and Vivado implementation only: no board. Timing met at 156.25 MHz on an Artix-7 100T (out of context, Vivado 2024.1); Phase 8 write-up in progress.
 
 ## Status
 
@@ -18,7 +18,7 @@ synthesised and timed in Vivado for an Artix-7.
 | 4 | ITCH 5.0 decoder and symbol filter | done: verified on 1M real Nasdaq messages |
 | 5 | Top-of-book engine (BRAM order table, price ladder) | done |
 | 6 | End-to-end verification against the C++ book on real data | done: 1M real messages, 9,295 BBO updates identical to the C++ book; 333 ns wire-to-BBO |
-| 7 | Synthesis and timing closure | in progress: 59 MHz, then 115 MHz after re-pipelining the book engine; every block now pipelined for 156.25 MHz |
+| 7 | Synthesis and timing closure | done: **156.25 MHz met** on Artix-7 (WNS +0.141 ns, Fmax 159.8 MHz), 16.4k LUTs, 13.4k FFs, 48.5 BRAM, 1 DSP; reports in `syn/reports/` |
 | 8 | Write-up | |
 
 ## Running
@@ -102,7 +102,7 @@ lists the worst path into every block.
 | 3 | 115.2 MHz (WNS -2.28 ns) | every block 0.6-2.3 ns short: checksum add-fold-compare before the accept decision; framer length to shift amount; decoder length and type checks in the last-beat cycle; RAM write ports and the 8,192-bit bitmap fed across the chip | checksum verdict one cycle later as a compare; length look-ahead in the framer; decode one cycle after capture; registered RAM write ports; bitmap write from pre-decoded word and bit enables; registered FIFO ready |
 | 4 | 107.3 MHz (WNS -2.92 ns) | framer: the FIFO's block-RAM output (2.5 ns, unregistered) fed the append-then-shift buffer; way-RAM read address routed to 36 RAM tiles (0 logic levels, -1.6 ns); RAM power-gating logic; replicated bitmap flag in a 7-level path | framer as a ring buffer (pointers move, data does not) behind a register slice; read address registered inside each RAM; RAM power optimisation off; bitmap flag in one flop, copied a cycle later; header, type and checksum checks precomputed a beat early; timing-driven Vivado directives |
 | 5 | 147.9 MHz (WNS -0.36 ns) | three paths left: framer look-ahead (ring view to next length to body registers, 8 levels); book 64-bit priority encoder (7); checksum fold-and-compare (12) | next length read one beat earlier into raw registers; priority encoders over two cycles; both fold results computed in parallel |
-| 6 | pending | | |
+| 6 | **156.25 MHz met: WNS +0.141 ns, WHS +0.072 ns, Fmax 159.8 MHz** | worst path now the framer's view mux into the body registers (6 levels, 80% routing) | — |
 
 ## Verification
 
