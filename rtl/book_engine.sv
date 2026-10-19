@@ -87,7 +87,7 @@ module book_engine #(
 
     typedef enum logic [4:0] {
         CLEAR, IDLE, RD1, RD2, RD3, TAG, DECIDE, APPLY, LV1, LV2, LV3, LADD, LWR, LBM, URD,
-        B1, B2, B3, B4, B5, B6, B7, B7B, B8, OUT
+        B1, B2, B2B, B3, B4, B4B, B5, B6, B7, B7B, B8, OUT
     } state_t;
     state_t state;
 
@@ -258,6 +258,9 @@ module book_engine #(
     logic [NW-1:0] sum_bid_q, sum_ask_q;
     logic          has_bid, has_ask;
     logic [5:0]    bw_bid, bw_ask;
+    // priority encoders split over two cycles: per-group "any" and index, then select
+    logic [7:0]    pg_any_bid, pg_any_ask;
+    logic [2:0]    pg_idx_bid [8], pg_idx_ask [8];
     logic [63:0]   word_bid, word_ask;
     logic [WIN_BITS-1:0] best_bid, best_ask;
     logic [18:0]   bid100, ask100;
@@ -420,11 +423,20 @@ module book_engine #(
                     end
                     state <= B2;
                 end
-                B2: begin                                            // best word
+                B2: begin                                            // best word, step 1: per group of 8
                     has_bid <= |sum_bid_q;
                     has_ask <= |sum_ask_q;
-                    bw_bid  <= highest(sum_bid_q);
-                    bw_ask  <= lowest(sum_ask_q);
+                    for (int g = 0; g < 8; g++) begin
+                        pg_any_bid[g] <= |sum_bid_q[8*g +: 8];
+                        pg_any_ask[g] <= |sum_ask_q[8*g +: 8];
+                        pg_idx_bid[g] <= hi8(sum_bid_q[8*g +: 8]);
+                        pg_idx_ask[g] <= lo8(sum_ask_q[8*g +: 8]);
+                    end
+                    state <= B2B;
+                end
+                B2B: begin                                           // step 2: pick the group
+                    bw_bid <= {hi8(pg_any_bid), pg_idx_bid[hi8(pg_any_bid)]};
+                    bw_ask <= {lo8(pg_any_ask), pg_idx_ask[lo8(pg_any_ask)]};
                     state <= B3;
                 end
                 B3: begin                                            // fetch that word
@@ -432,9 +444,18 @@ module book_engine #(
                     word_ask <= bm_ask[64*bw_ask +: 64];
                     state <= B4;
                 end
-                B4: begin                                            // best bit in the word
-                    best_bid <= {bw_bid, highest(word_bid)};
-                    best_ask <= {bw_ask, lowest(word_ask)};
+                B4: begin                                            // best bit, step 1: per group of 8
+                    for (int g = 0; g < 8; g++) begin
+                        pg_any_bid[g] <= |word_bid[8*g +: 8];
+                        pg_any_ask[g] <= |word_ask[8*g +: 8];
+                        pg_idx_bid[g] <= hi8(word_bid[8*g +: 8]);
+                        pg_idx_ask[g] <= lo8(word_ask[8*g +: 8]);
+                    end
+                    state <= B4B;
+                end
+                B4B: begin                                           // step 2: pick the group
+                    best_bid <= {bw_bid, hi8(pg_any_bid), pg_idx_bid[hi8(pg_any_bid)]};
+                    best_ask <= {bw_ask, lo8(pg_any_ask), pg_idx_ask[lo8(pg_any_ask)]};
                     state <= B5;
                 end
                 B5: begin                                            // level reads; 100 x index

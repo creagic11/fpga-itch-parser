@@ -178,3 +178,41 @@ async def mixed_traffic_under_backpressure(dut):
     assert snk.empty()
     c = counters(dut)
     assert c["accepted"] == len(want) and c["frames"] == 5000, c
+
+
+
+def carry_trap(payload: bytes, dst: str) -> bytes:
+    """A frame with a wrong IPv4 checksum chosen so that the first nine header words
+    sum to a value whose 16-bit fold carries, and where using the fold without its
+    end-around carry would make the header look valid. A valid header can never make
+    the fold carry, so this is the only way to exercise that branch."""
+    f = bytearray(frame(payload, dst=dst))
+    hdr = f[14:34]
+    words = [int.from_bytes(hdr[i:i + 2], "big") for i in range(0, 20, 2)]
+    s8 = sum(words[:9]) - words[5]                  # nine words minus the checksum word
+    w10 = words[9]
+    for c in range(65536):
+        acc = s8 + c
+        lo_hi = (acc & 0xFFFF) + (acc >> 16)
+        if lo_hi > 0xFFFF and (lo_hi & 0xFFFF) == (~w10 & 0xFFFF):
+            f[24:26] = c.to_bytes(2, "big")
+            return bytes(f)
+    raise AssertionError("no checksum value builds the trap")
+
+
+@cocotb.test(timeout_time=1, timeout_unit="ms")
+async def checksum_fold_with_carry(dut):
+    """A bad checksum that only an incomplete fold (no end-around carry) would accept."""
+    src, snk = await setup(dut)
+    # The trap needs the last header word (destination address, low half) >= 0xFFF8.
+    dst = "233.54.255.255"
+    dut.cfg_dst_ip.value = 0xE936FFFF
+    good = b"CARRY-ME" * 4
+    await src.send(AxiStreamFrame(carry_trap(good, dst)))
+    await src.send(AxiStreamFrame(frame(good, dst=dst)))
+    got = await snk.recv()
+    assert bytes(got.tdata) == good
+    await drain(dut)
+    assert snk.empty(), "the bad-checksum frame was accepted"
+    c = counters(dut)
+    assert c["drop_csum"] == 1 and c["accepted"] == 1, c

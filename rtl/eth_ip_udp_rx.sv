@@ -111,9 +111,14 @@ module eth_ip_udp_rx (
     wire bad_ip   = ip_bad_pre || (udp_len_b4 < 16'd9) || (udp_len_b4 > ip_len_m20);
     // Checksum: the first nine words folded (f) plus the tenth (w) must be 0xFFFF in
     // ones' complement, i.e. w == ~f (or f == w == 0xFFFF): a compare, not an adder.
-    wire [15:0] csum_f   = fold(csum_acc);
+    // The fold's two additions run in parallel: s = low + high (17 bits) and s + 1;
+    // the carry of s picks which one is the folded sum, and both are compared.
     wire [15:0] csum_w   = word(d, 0);
-    wire csum_ok_b4 = (csum_w == ~csum_f) || (csum_f == 16'hFFFF && csum_w == 16'hFFFF);
+    wire [16:0] fs0      = {1'b0, csum_acc[15:0]} + {13'd0, csum_acc[19:16]};
+    wire [15:0] fs1      = csum_acc[15:0] + {12'd0, csum_acc[19:16]} + 16'd1;
+    wire        ok0      = (csum_w == ~fs0[15:0]) || (fs0[15:0] == 16'hFFFF && csum_w == 16'hFFFF);
+    wire        ok1      = (csum_w == ~fs1[15:0]) || (fs1[15:0] == 16'hFFFF && csum_w == 16'hFFFF);
+    wire csum_ok_b4 = fs0[16] ? ok1 : ok0;
     wire csum_ok  = csum_ok_q;
     wire pass     = csum_ok_q && !dst_bad_q;  // CHK: forward this frame
     wire bad_dst  = (dst_ip_b4 != cfg_dst_ip) || (dst_port_b4 != cfg_dst_port);

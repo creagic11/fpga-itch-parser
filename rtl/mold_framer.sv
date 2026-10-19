@@ -74,7 +74,7 @@ module mold_framer (
     logic [7:0]      ring [NB];
     logic [4:0]      rd_ptr, wr_ptr;
     logic [5:0]      cnt;          // bytes held (0..32)
-    logic [7:0]      v [10];       // view: v[j] = ring[rd_ptr + j], the next 10 bytes
+    logic [7:0]      v [18];       // view: v[j] = ring[rd_ptr + j], the next 18 bytes
     logic            closed;       // the current packet's last beat is in the buffer
     logic            pkt_err;      // upstream flagged this payload as truncated
 
@@ -90,6 +90,11 @@ module mold_framer (
     logic [4:0]      nb2_q;        // nb_q + 2 (tail plus the next length field)
     logic            last_q;       // body_left <= 8: the next beat ends the message
     logic            zero_q;       // body_left == 0: empty message
+    // Look-ahead, one beat early: on the second-to-last beat of a message (9..16
+    // bytes left) the next message's length sits at offset body_left; it is
+    // registered raw, so the last beat only decodes registers.
+    logic [15:0]     la_len;
+    logic            la_v;         // la_len is valid (its bytes were held)
     // sequence checks of S_SEQ, registered for S_SEQ2
     logic [63:0]     sq_end, sq_back;
     logic [31:0]     sq_gap;
@@ -115,7 +120,7 @@ module mold_framer (
     assign s_axis_tready = !closed && (cnt <= 6'd24);
 
     always_comb
-        for (int j = 0; j < 10; j++) v[j] = ring[rd_ptr + 5'(j)];
+        for (int j = 0; j < 18; j++) v[j] = ring[rd_ptr + 5'(j)];
 
     // ---------------------------------------------------------------- parser (comb)
     wire out_free = !m_axis_tvalid || m_axis_tready;
@@ -131,11 +136,12 @@ module mold_framer (
 
     // Next message's length, read at the end of the current one (bytes nb_q and
     // nb_q + 1 of the buffer; used only when they are held, cnt >= nb2_q).
-    logic [15:0] next_len;
+    wire         pre = (state == S_BODY) && !last_q && (body_left <= 16'd16);   // 9..16 left
+    logic [15:0] pre_len;
     always_comb begin
-        next_len = '0;
-        for (int i = 0; i <= 8; i++)
-            if (nb_q == 4'(i)) next_len = {v[i], v[i + 1]};
+        pre_len = '0;
+        for (int i = 9; i <= 16; i++)
+            if (body_left[4:0] == 5'(i)) pre_len = {v[i], v[i + 1]};
     end
 
     logic [5:0]  take;         // bytes consumed from the front this cycle
@@ -179,7 +185,7 @@ module mold_framer (
                     msg_done = 1'b1;
                 end else if (dropping || out_free) begin
                     if (cnt >= {2'b0, nb_q}) begin
-                        chain  = last_q && !last_msg && (cnt >= {1'b0, nb2_q});
+                        chain  = last_q && !last_msg && la_v;
                         take   = chain ? {1'b0, nb2_q} : {2'b0, nb_q};
                         emit   = !dropping;
                         e_keep = keep_mask(nb_q);
@@ -237,6 +243,7 @@ module mold_framer (
             drop_left <= '0;
             msgs_left <= '0;
             last_msg <= 1'b0;
+            la_v <= 1'b0;
             {cnt_packets, cnt_messages, cnt_heartbeats, cnt_gaps} <= '0;
             {cnt_gap_msgs, cnt_dup_msgs, cnt_errors} <= '0;
         end else begin
@@ -275,13 +282,18 @@ module mold_framer (
             end
             if (truncated) cnt_errors <= cnt_errors + 1;
 
+            if (pre) begin                                   // look-ahead (see la_len)
+                la_len <= pre_len;
+                la_v   <= (cnt >= {1'b0, body_left[4:0]} + 6'd2);
+            end
+
             unique case (state)
                 S_HDR: begin
                     // header byte j = hdr_got + k sits in buffer lane k
                     for (int j = 10; j < 20; j++) begin
                         if (5'(j) >= hdr_got && {1'b0, 5'(j) - hdr_got} < take_hdr) begin
-                            if (j < 18) hdr_seq[8*(17 - j) +: 8]   <= v[4'(5'(j) - hdr_got) & 4'd7];
-                            else        hdr_count[8*(19 - j) +: 8] <= v[4'(5'(j) - hdr_got) & 4'd7];
+                            if (j < 18) hdr_seq[8*(17 - j) +: 8]   <= v[(5'(j) - hdr_got) & 5'd7];
+                            else        hdr_count[8*(19 - j) +: 8] <= v[(5'(j) - hdr_got) & 5'd7];
                         end
                     end
                     hdr_got <= hdr_got + take_hdr[4:0];
@@ -343,6 +355,7 @@ module mold_framer (
                         nb2_q     <= 5'd2 + {1'b0, nb_of(front_len)};
                         last_q    <= (front_len <= 16'd8);
                         zero_q    <= (front_len == 16'd0);
+                        la_v      <= 1'b0;
                         dropping  <= dup_now;
                         state <= S_BODY;
                     end
@@ -353,11 +366,12 @@ module mold_framer (
                         normal_end <= 1'b0;
                         state <= S_DRAIN;
                     end else if (chain) begin                // next message starts next cycle
-                        body_left <= next_len;
-                        nb_q      <= nb_of(next_len);
-                        nb2_q     <= 5'd2 + {1'b0, nb_of(next_len)};
-                        last_q    <= (next_len <= 16'd8);
-                        zero_q    <= (next_len == 16'd0);
+                        body_left <= la_len;
+                        nb_q      <= nb_of(la_len);
+                        nb2_q     <= 5'd2 + {1'b0, nb_of(la_len)};
+                        last_q    <= (la_len <= 16'd8);
+                        zero_q    <= (la_len == 16'd0);
+                        la_v      <= 1'b0;
                         dropping  <= dropping && (drop_left != 16'd1);
                     end else if (msg_done) begin
                         state <= last_msg ? S_DRAIN : S_LEN;
