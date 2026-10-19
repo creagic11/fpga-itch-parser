@@ -33,6 +33,28 @@ report_utilization    -file [file join $rpt ${top}_utilization.rpt]
 report_utilization    -hierarchical -file [file join $rpt ${top}_utilization_hier.rpt]
 write_checkpoint -force [file join $out ${top}_post_route.dcp]
 
+# Worst setup slack ending in each module, so a failing run shows every block
+# that needs work, not only the single worst path.
+set fh [open [file join $rpt ${top}_slack_by_module.rpt] w]
+puts $fh [format "%-40s %10s %7s  %s" "module instance" "WNS (ns)" "levels" "worst path start -> end"]
+set all_regs [get_cells -quiet -hier -filter {IS_SEQUENTIAL}]
+foreach inst [lsort [get_cells -hier -filter {IS_PRIMITIVE == 0}]] {
+    # Prefix match in plain Tcl: instance names contain brackets (g_way[0]),
+    # which a -filter glob would read as a character class.
+    set pre "$inst/"
+    set n [string length $pre]
+    set regs {}
+    foreach c $all_regs { if {[string equal -length $n $pre $c]} { lappend regs $c } }
+    if {[llength $regs] == 0} continue
+    set p [get_timing_paths -quiet -setup -max_paths 1 -nworst 1 -to $regs]
+    if {[llength $p] == 0} continue
+    set line [format "%-40s %10.3f %7s  %s -> %s" $inst [get_property SLACK $p] \
+              [get_property LOGIC_LEVELS $p] [get_property STARTPOINT_PIN $p] [get_property ENDPOINT_PIN $p]]
+    puts $fh $line
+    puts "== slack $line"
+}
+close $fh
+
 set wns [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -setup]]
 set whs [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -hold]]
 set period [get_property PERIOD [get_clocks clk]]

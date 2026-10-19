@@ -176,3 +176,72 @@ async def throughput_back_to_back_deletes(dut):
     dut._log.info(f"{cycles:.0f} cycles for {len(msgs)} messages: {per_msg:.2f} cycles/message, "
                   f"{21 * len(msgs) / cycles:.2f} input bytes/cycle")
     assert per_msg < 3.3, f"{per_msg:.2f} cycles per message"
+
+
+@cocotb.test(timeout_time=2, timeout_unit="ms")
+async def large_sequence_numbers(dut):
+    """Sequence numbers with every byte non-zero, so each of the 8 header bytes
+    must really be captured (small numbers would hide a missed high byte)."""
+    src, snk, seqs = await setup(dut)
+    rng = random.Random(3)
+    base = 0x0102030405060708
+    msgs = random_messages(rng, 300, 1, 60)
+    for p in mold.pack_stream(msgs, start_seq=base, max_payload=300):
+        await src.send(AxiStreamFrame(p))
+    await expect_messages(snk, seqs, [(base + i, m) for i, m in enumerate(msgs)])
+    await ClockCycles(dut.clk, 20)
+    c = counters(dut)
+    assert c["expected_seq"] == base + len(msgs), f"expected_seq {c['expected_seq']:#x}"
+    assert c["gaps"] == 0 and c["dup_msgs"] == 0 and c["errors"] == 0, c
+
+
+@cocotb.test(timeout_time=3, timeout_unit="ms")
+async def reset_mid_packet(dut):
+    """Reset while the buffer still holds part of a packet, then a fresh packet.
+    Regression for a real bug: the buffer was not cleared by reset, so its stale
+    bytes were OR-ed into the next header and corrupted the sequence number (the
+    next packet was then dropped as a duplicate)."""
+    src, snk, seqs = await setup(dut)
+    rng = random.Random(6)
+    snk.pause = True                                  # stall so the framer holds bytes
+    junk = bytes(rng.getrandbits(8) | 0x80 for _ in range(600))
+    await src.send(AxiStreamFrame(mold.packet(0x7F7F7F7F7F7F7F7F, [junk[:300], junk[300:]])))
+    await ClockCycles(dut.clk, 40)
+    assert int(dut.cnt.value) != 0, "test needs the buffer to be holding bytes at reset"
+    src.clear()
+    dut.rst.value = 1
+    await ClockCycles(dut.clk, 5)
+    dut.rst.value = 0
+    snk.clear()
+    snk.pause = False
+    await RisingEdge(dut.clk)
+    seqs.clear()
+    base = 0x0102030405060708
+    msgs = random_messages(rng, 50, 1, 60)
+    for p in mold.pack_stream(msgs, start_seq=base, max_payload=300):
+        await src.send(AxiStreamFrame(p))
+    await expect_messages(snk, seqs, [(base + i, m) for i, m in enumerate(msgs)])
+    await ClockCycles(dut.clk, 20)
+    c = counters(dut)
+    assert c["expected_seq"] == base + len(msgs), f"expected_seq {c['expected_seq']:#x}"
+    assert c["dup_msgs"] == 0 and c["gaps"] == 0, c
+
+
+@cocotb.test(timeout_time=3, timeout_unit="ms")
+async def junk_in_null_bytes(dut):
+    """Bytes outside tkeep on a packet's last beat are don't-care in AXI-Stream and
+    may carry leftovers; they must not reach the next packet."""
+    src, snk, seqs = await setup(dut)
+    rng = random.Random(5)
+    base = 0x0A0B0C0D0E0F1011
+    msgs = random_messages(rng, 400, 1, 60)
+    for p in mold.pack_stream(msgs, start_seq=base, max_payload=rng.choice([150, 333])):
+        pad = (-len(p)) % 8
+        f = AxiStreamFrame(p + bytes(rng.getrandbits(8) | 1 for _ in range(pad)),
+                           tkeep=[1] * len(p) + [0] * pad)
+        await src.send(f)
+    await expect_messages(snk, seqs, [(base + i, m) for i, m in enumerate(msgs)])
+    await ClockCycles(dut.clk, 20)
+    c = counters(dut)
+    assert c["gaps"] == 0 and c["dup_msgs"] == 0 and c["errors"] == 0, c
+    assert c["expected_seq"] == base + len(msgs)

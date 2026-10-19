@@ -8,17 +8,28 @@
 // Price ladder: a window of 4,096 ticks per side starting at cfg_base_price
 // (tick = $0.01 = 100 ITCH price units), level quantities in block RAM, and a
 // bitmap of non-empty levels in flip-flops. The best level comes from a
-// two-level priority encoder over the bitmap (64 words of 64 bits plus a
-// 64-bit summary), so when the best level empties the next best is found in
-// two cycles. Orders priced outside the window or off the tick grid are counted
-// and not booked.
+// two-level priority encoder over the bitmap (a 64-bit summary, then the chosen
+// 64-bit word). Orders priced outside the window or off the tick grid are
+// counted and not booked.
 //
-// Sequencing: one event at a time through a short state machine
-//   IDLE -> LOOKUP -> LVL_RD -> LVL_WR -> BBO1 -> BBO2 -> BBO3      (7 cycles)
-// A Replace runs the delete half, then the add half (U_RD re-reads the order set
-// for the new reference, then LOOKUP again): 10 cycles.
-// Because each step finishes before the next starts, no read-after-write
-// forwarding is needed. 7 cycles per event at 156.25 MHz = 22 M events/s.
+// Pipelining for 156.25 MHz: every state does one simple step, and every RAM
+// read comes out of the block RAM's output register (2-cycle latency):
+//   IDLE  accept event; order-set read issued; price - base
+//   RD1   price index: (diff x 5243) >> 19 in a DSP (= diff / 100)
+//   RD2   price index: round-trip and window check
+//   TAG   4 tag compares on the order set
+//   DECIDE  pick hit / free way, register the entry
+//   APPLY   write the order table; level read issued
+//   LV1 LV2  level read in flight
+//   LADD  level quantity +/- shares, non-zero flag
+//   LWR   write level quantity and bitmap bit
+//   B1..B8  best levels: word summary -> best word -> word -> best bit ->
+//           level reads + price = base + 100 x index -> compare with last BBO
+//   OUT   emit a BBO update if it changed
+// An Add takes 19 cycles (about 8 M events/s at 156.25 MHz); a Replace runs the
+// delete half, then URD re-reads the set for the new reference and runs the add
+// half. Events are handled one at a time, so no read-after-write forwarding is
+// needed.
 //
 // Output: a BBO update (prices in ITCH units, quantities in shares, the event's
 // sequence number) whenever the best bid or offer changes, same rule as the C++
@@ -74,8 +85,14 @@ module book_engine #(
         logic [31:0]         qty;
     } entry_t;
 
-    typedef enum logic [3:0] {CLEAR, IDLE, LOOKUP, LVL_RD, LVL_WR, BBO1, BBO2, BBO3, U_RD} state_t;
+    typedef enum logic [4:0] {
+        CLEAR, IDLE, RD1, RD2, TAG, DECIDE, APPLY, LV1, LV2, LADD, LWR, URD,
+        B1, B2, B3, B4, B5, B6, B7, B8, OUT
+    } state_t;
     state_t state;
+
+    // event types (E = 2, C = 3 and X = 4 all reduce an order, like the default case)
+    localparam logic [2:0] T_ADD = 3'd1, T_DELETE = 3'd5, T_REPLACE = 3'd6, T_TRADE = 3'd7;
 
     // After reset the block RAMs still hold whatever they held before (FPGA memories
     // are not cleared by a reset), so CLEAR walks every address writing zeros:
@@ -86,51 +103,46 @@ module book_engine #(
     // ---------------------------------------------------------------- current event
     logic [2:0]  e_type;
     logic [63:0] e_ref, e_new_ref, e_seq;
-    logic [31:0] e_shares, e_price;
+    logic [31:0] e_shares;
     logic        e_sell;
     logic        changed;            // a level changed during this event
     logic        u_add_pending;      // Replace: add half still to do
 
-    // ---------------------------------------------------------------- order table
-    // One block-RAM instance per way (4 x 4,096 x 78 bits).
-    entry_t      way_rd [WAYS];
-    logic [SET_BITS-1:0] set_rd_addr;
-    logic        way_we [WAYS];
-    entry_t      way_wd;
-    logic [SET_BITS-1:0] set_wr_addr;
+    // ---------------------------------------------------------------- order table RAMs
+    entry_t              way_rd [WAYS];
+    logic [SET_BITS-1:0] way_raddr;
+    logic                way_we [WAYS];
+    entry_t              way_wd;
 
     for (genvar w = 0; w < WAYS; w++) begin : g_way
         logic [$bits(entry_t)-1:0] rd_raw;
-        sdp_ram #(.W($bits(entry_t)), .DEPTH(NSETS)) u_ram (
-            .clk, .we(way_we[w]), .waddr(set_wr_addr), .wdata(way_wd),
-            .raddr(set_rd_addr), .rdata(rd_raw)
+        sdp_ram #(.W($bits(entry_t)), .DEPTH(NSETS), .OREG(1)) u_ram (
+            .clk, .we(way_we[w]),
+            .waddr((state == CLEAR) ? clr_addr[SET_BITS-1:0] : e_ref[SET_BITS-1:0]),
+            .wdata(way_wd), .raddr(way_raddr), .rdata(rd_raw)
         );
         assign way_rd[w] = entry_t'(rd_raw);
     end
 
-    // ---------------------------------------------------------------- level quantities
-    logic [WIN_BITS-1:0] lvl_rd_bid_addr, lvl_rd_ask_addr, lvl_wr_addr;
-    logic [47:0] lvl_rd_bid, lvl_rd_ask, lvl_wd;
-    logic        lvl_we_bid, lvl_we_ask;
+    // ---------------------------------------------------------------- level quantity RAMs
+    logic [WIN_BITS-1:0] lvl_raddr_bid, lvl_raddr_ask, op_pidx;
+    logic [47:0]         lvl_rd_bid, lvl_rd_ask, lvl_new;
+    logic                lvl_we_bid, lvl_we_ask;
+    wire  [WIN_BITS-1:0] lvl_waddr = (state == CLEAR) ? clr_addr[WIN_BITS-1:0] : op_pidx;
+    wire  [47:0]         lvl_wd    = (state == CLEAR) ? 48'd0 : lvl_new;
 
-    sdp_ram #(.W(48), .DEPTH(NLVL)) u_lvl_bid (
-        .clk, .we(lvl_we_bid), .waddr(lvl_wr_addr), .wdata(lvl_wd),
-        .raddr(lvl_rd_bid_addr), .rdata(lvl_rd_bid)
+    sdp_ram #(.W(48), .DEPTH(NLVL), .OREG(1)) u_lvl_bid (
+        .clk, .we(lvl_we_bid), .waddr(lvl_waddr), .wdata(lvl_wd),
+        .raddr(lvl_raddr_bid), .rdata(lvl_rd_bid)
     );
-    sdp_ram #(.W(48), .DEPTH(NLVL)) u_lvl_ask (
-        .clk, .we(lvl_we_ask), .waddr(lvl_wr_addr), .wdata(lvl_wd),
-        .raddr(lvl_rd_ask_addr), .rdata(lvl_rd_ask)
+    sdp_ram #(.W(48), .DEPTH(NLVL), .OREG(1)) u_lvl_ask (
+        .clk, .we(lvl_we_ask), .waddr(lvl_waddr), .wdata(lvl_wd),
+        .raddr(lvl_raddr_ask), .rdata(lvl_rd_ask)
     );
 
     // ---------------------------------------------------------------- non-empty bitmaps
     logic [NLVL-1:0] bm_bid, bm_ask;
-    logic [NW-1:0]   sum_bid, sum_ask;
-    always_comb begin
-        for (int w = 0; w < NW; w++) begin
-            sum_bid[w] = |bm_bid[64*w +: 64];
-            sum_ask[w] = |bm_ask[64*w +: 64];
-        end
-    end
+
     function automatic logic [5:0] highest(input logic [63:0] v);
         logic [5:0] r;
         r = '0;
@@ -144,117 +156,91 @@ module book_engine #(
         return r;
     endfunction
 
-    // ---------------------------------------------------------------- price -> level index
-    // (price - base) / 100 by multiplication: exact for every multiple of 100 below
-    // 4,096 x 100; anything else fails the round-trip check and is out of window.
-    function automatic logic [WIN_BITS-1:0] price_index(input logic [31:0] price, input logic [31:0] base,
-                                                      output logic ok);
-        logic [31:0] diff;
-        logic [44:0] prod;
-        logic [25:0] q;
-        diff = price - base;
-        prod = 45'(diff) * 45'd5243;
-        q = 26'(prod >> 19);
-        ok = (price >= base) && (q < 26'(NLVL)) && (32'(q) * 32'd100 == diff);
-        return q[WIN_BITS-1:0];
-    endfunction
+    // ---------------------------------------------------------------- price index pipeline
+    // (price - base) / 100 = (diff x 5243) >> 19, exact for every multiple of 100
+    // below 2^19; the round trip q x 100 == diff rejects anything off the grid.
+    logic [32:0] diff_q;                 // price - base, with borrow in bit 32
+    (* use_dsp = "yes" *) logic [12:0] q_raw_q;   // (diff x 5243) >> 19
+    logic        far_q, far_q2;          // below the base or >= 2^19 above it
+    logic [18:0] diff19_q, diff19_q2;
+    logic [12:0] q_q;
+    logic [WIN_BITS-1:0] pidx_q;
+    logic        pidx_ok_q;
 
-    // ---------------------------------------------------------------- lookup results (LOOKUP)
+    always_ff @(posedge clk) begin
+        // RD1: multiply
+        far_q    <= diff_q[32] || (diff_q[31:19] != '0);
+        diff19_q <= diff_q[18:0];
+        q_raw_q  <= 13'((32'(diff_q[18:0]) * 32'd5243) >> 19);
+        // RD2: quotient
+        far_q2    <= far_q;
+        diff19_q2 <= diff19_q;
+        q_q       <= q_raw_q;
+        // TAG: window and round-trip check
+        pidx_q    <= q_q[WIN_BITS-1:0];
+        pidx_ok_q <= !far_q2 && (q_q < 13'(NLVL)) &&
+                     ((19'(q_q) << 6) + (19'(q_q) << 5) + (19'(q_q) << 2) == diff19_q2);
+    end
+
+    // ---------------------------------------------------------------- lookup registers
     wire [TAGW-1:0] tag_of_e = e_ref[SET_BITS +: TAGW];
-    logic [WAYS-1:0] hit_v, free_v;
-    always_comb begin
-        for (int w = 0; w < WAYS; w++) begin
-            hit_v[w]  = way_rd[w].valid && (way_rd[w].tag == tag_of_e);
-            free_v[w] = !way_rd[w].valid;
-        end
-    end
-    logic [1:0] hit_way, free_way;
-    always_comb begin
-        hit_way = '0;
-        free_way = '0;
-        for (int w = WAYS - 1; w >= 0; w--) begin
-            if (hit_v[w])  hit_way  = 2'(w);
-            if (free_v[w]) free_way = 2'(w);
-        end
-    end
-    wire    hit      = |hit_v;
-    wire    any_free = |free_v;
-    entry_t hit_e;
-    assign  hit_e = way_rd[hit_way];
-    logic   pidx_ok;
-    logic [WIN_BITS-1:0] pidx_full;
-    always_comb pidx_full = price_index(e_price, cfg_base_price, pidx_ok);
-    wire    ref_ok = (e_ref[63:SET_BITS + TAGW] == '0);   // refs below 2^44 (a day is ~2^30)
+    wire            ref_ok   = (e_ref[63:SET_BITS + TAGW] == '0);   // refs below 2^44
+    logic [WAYS-1:0] hit_v_q, free_v_q;
+    entry_t          way_q [WAYS];
+    logic            hit_q, any_free_q;
+    logic [1:0]      hit_way_q, free_way_q;
+    entry_t          hit_e_q;
 
-    // level operation decided in LOOKUP, applied in LVL_RD / LVL_WR
-    logic                op_sell, op_add;
-    logic [WIN_BITS-1:0] op_pidx;
-    logic [31:0]         op_qty;
-
-    // ---------------------------------------------------------------- best levels (BBO1/BBO2)
-    logic [5:0]  bw_bid, bw_ask;                 // best word
-    logic        has_bid, has_ask;
-    logic [WIN_BITS-1:0] best_bid, best_ask;
-    logic [31:0] last_bid_px, last_ask_px;
-    logic [47:0] last_bid_qty, last_ask_qty;
-
-    assign ev_ready = (state == IDLE);
-
-    // BBO as it stands after the current event (valid in BBO3)
-    wire [31:0] bpx = has_bid ? cfg_base_price + 32'(best_bid) * 32'd100 : '0;
-    wire [31:0] apx = has_ask ? cfg_base_price + 32'(best_ask) * 32'd100 : '0;
-    wire [47:0] bq  = has_bid ? lvl_rd_bid : '0;
-    wire [47:0] aq  = has_ask ? lvl_rd_ask : '0;
+    // decisions in APPLY (all inputs registered)
+    wire whole = (e_type == T_DELETE) || (e_type == T_REPLACE) || (e_shares >= hit_e_q.qty);
+    wire add_ok = ref_ok && pidx_ok_q && !hit_q && any_free_q;
+    wire red_ok = ref_ok && hit_q;
 
     always_comb begin
-        // defaults: no writes
         for (int w = 0; w < WAYS; w++) way_we[w] = 1'b0;
         way_wd = '0;
-        set_wr_addr = e_ref[SET_BITS-1:0];
-        set_rd_addr = (state == IDLE) ? ev_ref[SET_BITS-1:0] : e_ref[SET_BITS-1:0];
-        lvl_we_bid = 1'b0;
-        lvl_we_ask = 1'b0;
-        lvl_wr_addr = op_pidx;
-        lvl_wd = '0;
-        lvl_rd_bid_addr = (state == BBO2) ? {bw_bid, highest(bm_bid[64*bw_bid +: 64])} : op_pidx;
-        lvl_rd_ask_addr = (state == BBO2) ? {bw_ask, lowest(bm_ask[64*bw_ask +: 64])}  : op_pidx;
-
         if (state == CLEAR) begin
             for (int w = 0; w < WAYS; w++) way_we[w] = 1'b1;
-            way_wd = '0;
-            set_wr_addr = clr_addr[SET_BITS-1:0];
-            lvl_we_bid = 1'b1;
-            lvl_we_ask = 1'b1;
-            lvl_wr_addr = clr_addr[WIN_BITS-1:0];
-            lvl_wd = '0;
-        end
-        if (state == LOOKUP) begin
-            unique case (e_type)
-                3'd1: if (ref_ok && pidx_ok && !hit && any_free) begin       // Add
-                    way_we[free_way] = 1'b1;
-                    way_wd = '{valid: 1'b1, sell: e_sell, tag: tag_of_e,
-                               pidx: pidx_full, qty: e_shares};
+        end else if (state == APPLY) begin
+            if (e_type == T_ADD) begin
+                if (add_ok) begin
+                    way_we[free_way_q] = 1'b1;
+                    way_wd = '{valid: 1'b1, sell: e_sell, tag: tag_of_e, pidx: pidx_q, qty: e_shares};
                 end
-                3'd2, 3'd3, 3'd4, 3'd5, 3'd6: if (ref_ok && hit) begin       // reduce / remove
-                    way_we[hit_way] = 1'b1;
-                    way_wd = hit_e;
-                    if (e_type == 3'd5 || e_type == 3'd6 || e_shares >= hit_e.qty) begin
-                        way_wd.valid = 1'b0;
-                        way_wd.qty = '0;
-                    end else begin
-                        way_wd.qty = hit_e.qty - e_shares;
-                    end
+            end else if (red_ok) begin
+                way_we[hit_way_q] = 1'b1;
+                way_wd = hit_e_q;
+                if (whole) begin
+                    way_wd.valid = 1'b0;
+                    way_wd.qty = '0;
+                end else begin
+                    way_wd.qty = hit_e_q.qty - e_shares;
                 end
-                default: ;
-            endcase
+            end
         end
-        if (state == LVL_WR) begin
-            lvl_wd = op_add ? (op_sell ? lvl_rd_ask : lvl_rd_bid) + 48'(op_qty)
-                            : (op_sell ? lvl_rd_ask : lvl_rd_bid) - 48'(op_qty);
-            lvl_we_bid = !op_sell;
-            lvl_we_ask = op_sell;
-        end
+        lvl_we_bid = (state == CLEAR) || (state == LWR && !op_sell);
+        lvl_we_ask = (state == CLEAR) || (state == LWR && op_sell);
     end
+
+    // level operation
+    logic        op_sell, op_add;
+    logic [31:0] op_qty;
+    wire  [47:0] lvl_cur = op_sell ? lvl_rd_ask : lvl_rd_bid;
+
+    // ---------------------------------------------------------------- best-level pipeline
+    logic [NW-1:0] sum_bid_q, sum_ask_q;
+    logic          has_bid, has_ask;
+    logic [5:0]    bw_bid, bw_ask;
+    logic [63:0]   word_bid, word_ask;
+    logic [WIN_BITS-1:0] best_bid, best_ask;
+    logic [18:0]   bid100, ask100;
+    logic [31:0]   bpx, apx;
+    logic [47:0]   bq, aq;
+    logic          differs;
+    logic [31:0]   last_bid_px, last_ask_px;
+    logic [47:0]   last_bid_qty, last_ask_qty;
+
+    assign ev_ready = (state == IDLE);
 
     // ---------------------------------------------------------------- state machine
     always_ff @(posedge clk) begin
@@ -284,86 +270,146 @@ module book_engine #(
                     e_new_ref <= ev_new_ref;
                     e_seq <= ev_seq;
                     e_shares <= ev_shares;
-                    e_price <= ev_price;
                     e_sell <= ev_side_sell;
+                    diff_q <= {1'b0, ev_price} - {1'b0, cfg_base_price};
+                    way_raddr <= ev_ref[SET_BITS-1:0];
                     changed <= 1'b0;
                     u_add_pending <= 1'b0;
                     cnt_events <= cnt_events + 1;
-                    state <= (ev_type == 3'd7 || ev_type == 3'd0) ? IDLE : LOOKUP;  // trades: no book change
+                    state <= (ev_type == T_TRADE || ev_type == 3'd0) ? IDLE : RD1;  // trades: no book change
                 end
 
-                LOOKUP: begin
-                    state <= (changed) ? BBO1 : IDLE;   // default: nothing to apply
-                    unique case (e_type)
-                        3'd1: begin                                  // Add
-                            if (!ref_ok || !pidx_ok) cnt_out_of_window <= cnt_out_of_window + 1;
-                            else if (hit) cnt_duplicates <= cnt_duplicates + 1;
-                            else if (!any_free) cnt_collisions <= cnt_collisions + 1;
-                            else begin
-                                op_sell <= e_sell;
-                                op_add  <= 1'b1;
-                                op_pidx <= pidx_full;
-                                op_qty  <= e_shares;
-                                live_orders <= live_orders + 1;
-                                state <= LVL_RD;
-                            end
-                        end
-                        3'd2, 3'd3, 3'd4, 3'd5, 3'd6: begin           // E, C, X, D, U (delete half)
-                            if (!ref_ok || !hit) begin
-                                cnt_unknown <= cnt_unknown + 1;
-                            end else begin
-                                op_sell <= hit_e.sell;
-                                op_add  <= 1'b0;
-                                op_pidx <= hit_e.pidx;
-                                op_qty  <= (e_type == 3'd5 || e_type == 3'd6 || e_shares >= hit_e.qty)
-                                           ? hit_e.qty : e_shares;
-                                if (e_type == 3'd5 || e_type == 3'd6 || e_shares >= hit_e.qty)
-                                    live_orders <= live_orders - 1;
-                                state <= LVL_RD;
-                            end
-                            if (e_type == 3'd6 && ref_ok && hit) begin
-                                u_add_pending <= 1'b1;               // add half: same side
-                                e_sell <= hit_e.sell;
-                            end
-                        end
-                        default: ;
-                    endcase
+                RD1: state <= RD2;                                   // set read + multiply
+                RD2: state <= TAG;                                   // set read + quotient
+
+                TAG: begin                                           // set data valid
+                    for (int w = 0; w < WAYS; w++) begin
+                        hit_v_q[w]  <= way_rd[w].valid && (way_rd[w].tag == tag_of_e);
+                        free_v_q[w] <= !way_rd[w].valid;
+                        way_q[w]    <= way_rd[w];
+                    end
+                    state <= DECIDE;
                 end
 
-                LVL_RD: state <= LVL_WR;                             // level read in flight
+                DECIDE: begin
+                    hit_q <= |hit_v_q;
+                    any_free_q <= |free_v_q;
+                    for (int w = WAYS - 1; w >= 0; w--) begin
+                        if (hit_v_q[w])  begin hit_way_q  <= 2'(w); hit_e_q <= way_q[w]; end
+                        if (free_v_q[w]) free_way_q <= 2'(w);
+                    end
+                    state <= APPLY;
+                end
 
-                U_RD: state <= LOOKUP;                               // order-set read in flight
-
-                LVL_WR: begin
-                    changed <= 1'b1;
-                    if (op_sell) bm_ask[op_pidx] <= (lvl_wd != '0);
-                    else         bm_bid[op_pidx] <= (lvl_wd != '0);
-                    if (u_add_pending) begin                         // Replace: now the add half
-                        u_add_pending <= 1'b0;
-                        e_type <= 3'd1;
-                        e_ref  <= e_new_ref;
-                        state  <= U_RD;                         // read the new ref's set
+                APPLY: begin
+                    state <= changed ? B1 : IDLE;                    // default: nothing to apply
+                    if (e_type == T_ADD) begin
+                        if (!ref_ok || !pidx_ok_q) cnt_out_of_window <= cnt_out_of_window + 1;
+                        else if (hit_q) cnt_duplicates <= cnt_duplicates + 1;
+                        else if (!any_free_q) cnt_collisions <= cnt_collisions + 1;
+                        else begin
+                            op_sell <= e_sell;
+                            op_add  <= 1'b1;
+                            op_pidx <= pidx_q;
+                            op_qty  <= e_shares;
+                            lvl_raddr_bid <= pidx_q;
+                            lvl_raddr_ask <= pidx_q;
+                            live_orders <= live_orders + 1;
+                            state <= LV1;
+                        end
+                    end else if (!red_ok) begin
+                        cnt_unknown <= cnt_unknown + 1;
                     end else begin
-                        state <= BBO1;
+                        op_sell <= hit_e_q.sell;
+                        op_add  <= 1'b0;
+                        op_pidx <= hit_e_q.pidx;
+                        op_qty  <= whole ? hit_e_q.qty : e_shares;
+                        lvl_raddr_bid <= hit_e_q.pidx;
+                        lvl_raddr_ask <= hit_e_q.pidx;
+                        if (whole) live_orders <= live_orders - 1;
+                        if (e_type == T_REPLACE) begin
+                            u_add_pending <= 1'b1;                   // add half: same side
+                            e_sell <= hit_e_q.sell;
+                        end
+                        state <= LV1;
                     end
                 end
 
-                BBO1: begin
-                    has_bid <= |sum_bid;
-                    has_ask <= |sum_ask;
-                    bw_bid  <= highest(sum_bid);
-                    bw_ask  <= lowest(sum_ask);
-                    state   <= BBO2;
+                LV1: state <= LV2;                                   // level read in flight
+                LV2: state <= LADD;
+
+                LADD: begin
+                    lvl_new <= op_add ? lvl_cur + 48'(op_qty) : lvl_cur - 48'(op_qty);
+                    state <= LWR;
                 end
 
-                BBO2: begin                                          // level reads issued here
-                    best_bid <= {bw_bid, highest(bm_bid[64*bw_bid +: 64])};
-                    best_ask <= {bw_ask, lowest(bm_ask[64*bw_ask +: 64])};
-                    state <= BBO3;
+                LWR: begin
+                    changed <= 1'b1;
+                    if (op_sell) bm_ask[op_pidx] <= (lvl_new != '0);
+                    else         bm_bid[op_pidx] <= (lvl_new != '0);
+                    if (u_add_pending) begin                         // Replace: now the add half
+                        u_add_pending <= 1'b0;
+                        e_type <= T_ADD;
+                        e_ref <= e_new_ref;
+                        state <= URD;
+                    end else begin
+                        state <= B1;
+                    end
                 end
 
-                BBO3: if (!bbo_valid || bbo_ready) begin
-                    if (bpx != last_bid_px || apx != last_ask_px || bq != last_bid_qty || aq != last_ask_qty) begin
+                URD: begin
+                    way_raddr <= e_ref[SET_BITS-1:0];                // e_ref is now the new ref
+                    state <= RD1;
+                end
+
+                B1: begin                                            // which 64-level words are non-empty
+                    for (int w = 0; w < NW; w++) begin
+                        sum_bid_q[w] <= |bm_bid[64*w +: 64];
+                        sum_ask_q[w] <= |bm_ask[64*w +: 64];
+                    end
+                    state <= B2;
+                end
+                B2: begin                                            // best word
+                    has_bid <= |sum_bid_q;
+                    has_ask <= |sum_ask_q;
+                    bw_bid  <= highest(sum_bid_q);
+                    bw_ask  <= lowest(sum_ask_q);
+                    state <= B3;
+                end
+                B3: begin                                            // fetch that word
+                    word_bid <= bm_bid[64*bw_bid +: 64];
+                    word_ask <= bm_ask[64*bw_ask +: 64];
+                    state <= B4;
+                end
+                B4: begin                                            // best bit in the word
+                    best_bid <= {bw_bid, highest(word_bid)};
+                    best_ask <= {bw_ask, lowest(word_ask)};
+                    state <= B5;
+                end
+                B5: begin                                            // level reads; 100 x index
+                    lvl_raddr_bid <= best_bid;
+                    lvl_raddr_ask <= best_ask;
+                    bid100 <= (19'(best_bid) << 6) + (19'(best_bid) << 5) + (19'(best_bid) << 2);
+                    ask100 <= (19'(best_ask) << 6) + (19'(best_ask) << 5) + (19'(best_ask) << 2);
+                    state <= B6;
+                end
+                B6: begin
+                    bpx <= has_bid ? cfg_base_price + 32'(bid100) : '0;
+                    apx <= has_ask ? cfg_base_price + 32'(ask100) : '0;
+                    state <= B7;
+                end
+                B7: state <= B8;                                     // level reads in flight
+                B8: begin
+                    bq <= has_bid ? lvl_rd_bid : '0;
+                    aq <= has_ask ? lvl_rd_ask : '0;
+                    differs <= (bpx != last_bid_px) || (apx != last_ask_px) ||
+                               ((has_bid ? lvl_rd_bid : '0) != last_bid_qty) ||
+                               ((has_ask ? lvl_rd_ask : '0) != last_ask_qty);
+                    state <= OUT;
+                end
+                OUT: begin
+                    if (!differs) state <= IDLE;
+                    else if (!bbo_valid || bbo_ready) begin
                         bbo_valid   <= 1'b1;
                         bbo_bid_px  <= bpx;
                         bbo_ask_px  <= apx;
@@ -375,8 +421,8 @@ module book_engine #(
                         last_ask_px <= apx;
                         last_bid_qty <= bq;
                         last_ask_qty <= aq;
+                        state <= IDLE;
                     end
-                    state <= IDLE;
                 end
 
                 default: state <= IDLE;

@@ -21,8 +21,10 @@ Vivado 2024.1 on Windows, out-of-context implementation of the whole design
 
 4. Reports are written to `syn\reports\`:
    `itch_book_top_timing_summary.rpt`, `itch_book_top_critical_paths.rpt`,
-   `itch_book_top_utilization.rpt`, `itch_book_top_utilization_hier.rpt`.
-   Send these four files back (or commit them); the critical-path report says what to
-   pipeline if timing fails.
+   `itch_book_top_utilization.rpt`, `itch_book_top_utilization_hier.rpt`,
+   `itch_book_top_slack_by_module.rpt`.
+   Send these five files back (or commit them). The slack-by-module report lists the worst
+   path ending in each block (also printed as `== slack` lines), so a failing run shows every
+   block that needs pipelining, not only the worst one.
 
 Other tops: `syn\build.bat udp_rx_top` (receiver only), `syn\build.bat book_engine`.

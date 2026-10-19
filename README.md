@@ -17,8 +17,8 @@ synthesised and timed in Vivado for an Artix-7.
 | 3 | MoldUDP64 framer: message splitting across beats, sequence gaps | done |
 | 4 | ITCH 5.0 decoder and symbol filter | done: verified on 1M real Nasdaq messages |
 | 5 | Top-of-book engine (BRAM order table, price ladder) | done |
-| 6 | End-to-end verification against the C++ book on real data | done: 1M real messages, 9,295 BBO updates identical to the C++ book; 192 ns wire-to-BBO |
-| 7 | Synthesis and timing closure | |
+| 6 | End-to-end verification against the C++ book on real data | done: 1M real messages, 9,295 BBO updates identical to the C++ book; 269 ns wire-to-BBO |
+| 7 | Synthesis and timing closure | in progress: first run 59 MHz (book engine); engine re-pipelined |
 | 8 | Write-up | |
 
 ## Running
@@ -70,23 +70,25 @@ ITCH_LOCATE=8124 ITCH_BASE=582900 python3 tb/run.py itch_book
 ```
 
 **Wire-to-BBO latency (simulation, 156.25 MHz).** A 100-byte frame carrying one Add that
-improves the bid: **30 cycles = 192 ns** from the frame's first beat entering the design to the
+improves the bid: **42 cycles = 268.8 ns** from the frame's first beat entering the design to the
 BBO update leaving it, of which 13 cycles are the frame itself arriving at 8 bytes per cycle.
-A Delete of the best bid (the priority encoder finds the next level): 28 cycles. Every
+A Delete of the best bid (the priority encoder finds the next level): 40 cycles. (The first
+version took 30 cycles but only reached 59 MHz in Vivado; the book engine was re-pipelined
+for 156.25 MHz, which added 12 cycles.) Every
 measurement is identical (min = median = max), as expected of a design with no caches or
 arbitration on this path.
 
 **Throughput.** The receive chain keeps up with 10 Gb/s line rate for typical ITCH traffic;
 the framer's worst case (back-to-back 19-byte Deletes) is 6.5 of 8 bytes per cycle. The book
-engine takes 7 cycles per event (10 for a Replace), about 22 M events/s, far above the
+engine takes about 20 cycles per event (random mix), about 8 M events/s, far above the
 message rate of any single stock.
 
 - **eth_ip_udp_rx.** All header fields needed to accept or drop a frame arrive by beat 4, and the IPv4 checksum is summed as the beats arrive. The decision is registered as the payload starts (byte 42, beat 5, lane 2), so no extra latency is added. Drops: non-IPv4 (incl. VLAN), IP options, fragments, non-UDP, bad checksum, other destination IP or port, frames ending inside the headers. The payload is trimmed to the UDP length, which strips Ethernet padding; a frame ending early is flagged with `tuser`.
 - **realign.** Shifts the payload 2 bytes so every message stream starts at lane 0: output beat k = input beat k lanes 2..7 + input beat k+1 lanes 0..1, plus one flush beat when the last input beat has bytes left in lanes 2..7.
 - **axis_skid.** Two-entry register slice between stages, so `tready` is never a long combinational chain.
 - **itch_decode.** Every field the book needs lies in a message's first 40 bytes, so five beats are captured and fields are cut at fixed offsets per type when the last beat arrives: no searching, just a type-indexed mux. The length is checked against the type (all 23 ITCH 5.0 types), non-book messages are counted and dropped, and an optional filter keeps one stock (by locate code). Event codes match the C++ decoder in `lowlat-orderbook`.
-- **book_engine.** Top of book for one stock. Orders live in a 4-way set-associative table in block RAM (4,096 sets indexed by the low bits of the order reference, 32-bit tags); a full set is counted as a collision. Prices map into a 4,096-tick window per side ($40.96 at $0.01 ticks) with level quantities in block RAM and a bitmap of non-empty levels; a two-level priority encoder (64-bit summary, then the 64-bit word) finds the next best price when the best level empties. Each event runs through a 7-state sequence (10 cycles for a Replace), so no read-after-write forwarding is needed: about 22 M events/s at 156.25 MHz. After reset a clear pass zeroes the block RAMs, because FPGA memories keep their contents through a reset (a bug the test bench caught: the second test saw the first test's orders).
-- **mold_framer.** A 24-byte buffer: input beats are appended behind the bytes held, and the parser consumes from the front, so a message may start at any byte and a length field may straddle two beats. The 2-byte length and the first 8 message bytes leave in the same cycle, so a message costs one cycle per output beat. Sequence tracking: a packet starting beyond the expected number is a gap (counted, with the missing count); messages below it are duplicates (for example the other copy of an A/B feed) and are dropped. Heartbeats and end-of-session are recognised. A packet ending inside a message closes it with `tuser` set.
+- **book_engine.** Top of book for one stock. Orders live in a 4-way set-associative table in block RAM (4,096 sets indexed by the low bits of the order reference, 32-bit tags); a full set is counted as a collision. Prices map into a 4,096-tick window per side ($40.96 at $0.01 ticks) with level quantities in block RAM and a bitmap of non-empty levels; a two-level priority encoder (64-bit summary, then the 64-bit word) finds the next best price when the best level empties. Each event runs through a pipelined sequence of single-step states (19 cycles for an Add, two passes for a Replace), every block-RAM read uses the RAM's output register, and the price-to-level division by 100 is a multiply by 5,243 and a shift in a DSP; events are handled one at a time, so no read-after-write forwarding is needed: about 8 M events/s at 156.25 MHz. After reset a clear pass zeroes the block RAMs, because FPGA memories keep their contents through a reset (a bug the test bench caught: the second test saw the first test's orders).
+- **mold_framer.** A 24-byte buffer: input beats are appended behind the bytes held, and the parser consumes from the front, so a message may start at any byte and a length field may straddle two beats. The 2-byte length and the first 8 message bytes leave in the same cycle, so a message costs one cycle per output beat. Sequence tracking: a packet starting beyond the expected number is a gap (counted, with the missing count); messages below it are duplicates (for example the other copy of an A/B feed) and are dropped. Heartbeats and end-of-session are recognised. A packet ending inside a message closes it with `tuser` set. Buffer bytes beyond the held count are kept at zero (input bytes outside `tkeep` are masked, and reset clears the buffer), since new beats are OR-ed in behind the held bytes.
 
 ## Verification
 
@@ -97,9 +99,9 @@ message rate of any single stock.
 | `itch_rx` | full chain from Ethernet frames: 6,000 messages of all 23 ITCH types with random field values; stock filter, wrong-length and unknown messages under random stalls on input and output; **a slice of a real Nasdaq BX day (1,000,000 messages)**, every decoded field compared with a Python decoder |
 | `book` | directed scenarios; 10,000 random events over ~600 levels identical to an unbounded order book (with 30% output stalls); window edges, below-base, off-grid and beyond-window prices; set collisions, duplicate refs, freed ways; every counter checked against a Python model of the hardware rules |
 | `itch_book` | full design from Ethernet frames: two interleaved stocks with the filter keeping one, identical to an unbounded order book under random stalls; wire-to-BBO latency; **real Nasdaq slice vs the C++ book** (opt-in, ~12 minutes) |
-| `mold` | 1,520 messages of 1-80 and 200-600 bytes (every start lane); heartbeats, gaps, duplicate packets, end of session; cut header, cut message, trailing bytes; 20,000 messages under random stalls; sequence number checked on every message |
+| `mold` | 1,520 messages of 1-80 and 200-600 bytes (every start lane); heartbeats, gaps, duplicate packets, end of session; cut header, cut message, trailing bytes; 20,000 messages under random stalls; sequence numbers with every byte non-zero; junk in bytes outside `tkeep`; reset while the buffer holds part of a packet; sequence number checked on every message |
 
-Frames come from scapy, an independent implementation of the protocols. Every output port is checked each cycle for AXI-Stream rule violations (`tvalid` dropped or payload changed while stalled), and every output beat is checked to be lane-0 aligned. Planted bugs (a skid buffer that overwrites a stalled beat, a checksum that skips a word, a realigner that loses the last bytes, a framer reading the body one byte off, a duplicate count off by one, a Replace price read one byte off, a stock filter that ignores its setting, a best-ask search that picks the highest word, a partial execution that is not stored) each make the benches fail.
+Frames come from scapy, an independent implementation of the protocols. Every output port is checked each cycle for AXI-Stream rule violations (`tvalid` dropped or payload changed while stalled), and every output beat is checked to be lane-0 aligned. Planted bugs (a skid buffer that overwrites a stalled beat, a checksum that skips a word, a realigner that loses the last bytes, a framer reading the body one byte off, a duplicate count off by one, a Replace price read one byte off, a stock filter that ignores its setting, a best-ask search that picks the highest word, a partial execution that is not stored, a level quantity that is never reduced, an off-grid price check that is skipped, a framer buffer not cleared by reset) each make the benches fail.
 
 **Real data.** `ITCH_REAL=/path/to/20191230.BX_ITCH_50 ITCH_REAL_N=1000000 python3 tb/run.py itch_rx` packs the first N messages of a Nasdaq sample file into MoldUDP64 packets inside Ethernet frames and checks every decoded event. The data file is not in the repo (`scripts` in `lowlat-orderbook` downloads it).
 

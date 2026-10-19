@@ -181,12 +181,19 @@ module mold_framer (
     // ---------------------------------------------------------------- buffer update
     wire [4:0]       kept     = cnt - take;
     wire [8*NB-1:0]  shifted  = buf_q >> (8 * take);
-    wire [8*NB-1:0]  appended = {{(8*NB-64){1'b0}}, s_axis_tdata} << (8 * kept);
+    // Invariant: every buffer byte at or beyond `cnt` is zero, so a new beat can be
+    // OR-ed in behind the held bytes. Bytes outside tkeep are don't-care in
+    // AXI-Stream (they can carry leftovers), so they are zeroed on the way in.
+    logic [63:0] in_masked;
+    always_comb
+        for (int i = 0; i < 8; i++) in_masked[8*i +: 8] = (4'(i) < in_bytes) ? s_axis_tdata[8*i +: 8] : 8'h00;
+    wire [8*NB-1:0]  appended = {{(8*NB-64){1'b0}}, in_masked} << (8 * kept);
     wire             in_dup   = (state == S_LEN) ? dup_now : dropping;
 
     always_ff @(posedge clk) begin
         if (rst) begin
             state <= S_HDR;
+            buf_q <= '0;
             cnt <= '0;
             closed <= 1'b0;
             pkt_err <= 1'b0;
