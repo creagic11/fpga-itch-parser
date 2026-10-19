@@ -92,33 +92,35 @@ module book_engine #(
     logic        u_add_pending;      // Replace: add half still to do
 
     // ---------------------------------------------------------------- order table
-    entry_t      ways_q [WAYS][NSETS];
+    // One block-RAM instance per way (4 x 4,096 x 78 bits).
     entry_t      way_rd [WAYS];
     logic [SET_BITS-1:0] set_rd_addr;
     logic        way_we [WAYS];
     entry_t      way_wd;
     logic [SET_BITS-1:0] set_wr_addr;
 
-    always_ff @(posedge clk) begin
-        for (int w = 0; w < WAYS; w++) begin
-            if (way_we[w]) ways_q[w][set_wr_addr] <= way_wd;
-            way_rd[w] <= ways_q[w][set_rd_addr];
-        end
+    for (genvar w = 0; w < WAYS; w++) begin : g_way
+        logic [$bits(entry_t)-1:0] rd_raw;
+        sdp_ram #(.W($bits(entry_t)), .DEPTH(NSETS)) u_ram (
+            .clk, .we(way_we[w]), .waddr(set_wr_addr), .wdata(way_wd),
+            .raddr(set_rd_addr), .rdata(rd_raw)
+        );
+        assign way_rd[w] = entry_t'(rd_raw);
     end
 
     // ---------------------------------------------------------------- level quantities
-    logic [47:0] lvl_bid [NLVL];
-    logic [47:0] lvl_ask [NLVL];
     logic [WIN_BITS-1:0] lvl_rd_bid_addr, lvl_rd_ask_addr, lvl_wr_addr;
     logic [47:0] lvl_rd_bid, lvl_rd_ask, lvl_wd;
     logic        lvl_we_bid, lvl_we_ask;
 
-    always_ff @(posedge clk) begin
-        if (lvl_we_bid) lvl_bid[lvl_wr_addr] <= lvl_wd;
-        if (lvl_we_ask) lvl_ask[lvl_wr_addr] <= lvl_wd;
-        lvl_rd_bid <= lvl_bid[lvl_rd_bid_addr];
-        lvl_rd_ask <= lvl_ask[lvl_rd_ask_addr];
-    end
+    sdp_ram #(.W(48), .DEPTH(NLVL)) u_lvl_bid (
+        .clk, .we(lvl_we_bid), .waddr(lvl_wr_addr), .wdata(lvl_wd),
+        .raddr(lvl_rd_bid_addr), .rdata(lvl_rd_bid)
+    );
+    sdp_ram #(.W(48), .DEPTH(NLVL)) u_lvl_ask (
+        .clk, .we(lvl_we_ask), .waddr(lvl_wr_addr), .wdata(lvl_wd),
+        .raddr(lvl_rd_ask_addr), .rdata(lvl_rd_ask)
+    );
 
     // ---------------------------------------------------------------- non-empty bitmaps
     logic [NLVL-1:0] bm_bid, bm_ask;
@@ -197,6 +199,12 @@ module book_engine #(
     logic [47:0] last_bid_qty, last_ask_qty;
 
     assign ev_ready = (state == IDLE);
+
+    // BBO as it stands after the current event (valid in BBO3)
+    wire [31:0] bpx = has_bid ? cfg_base_price + 32'(best_bid) * 32'd100 : '0;
+    wire [31:0] apx = has_ask ? cfg_base_price + 32'(best_ask) * 32'd100 : '0;
+    wire [47:0] bq  = has_bid ? lvl_rd_bid : '0;
+    wire [47:0] aq  = has_ask ? lvl_rd_ask : '0;
 
     always_comb begin
         // defaults: no writes
@@ -355,10 +363,6 @@ module book_engine #(
                 end
 
                 BBO3: if (!bbo_valid || bbo_ready) begin
-                    automatic logic [31:0] bpx = has_bid ? cfg_base_price + 32'(best_bid) * 32'd100 : '0;
-                    automatic logic [31:0] apx = has_ask ? cfg_base_price + 32'(best_ask) * 32'd100 : '0;
-                    automatic logic [47:0] bq  = has_bid ? lvl_rd_bid : '0;
-                    automatic logic [47:0] aq  = has_ask ? lvl_rd_ask : '0;
                     if (bpx != last_bid_px || apx != last_ask_px || bq != last_bid_qty || aq != last_ask_qty) begin
                         bbo_valid   <= 1'b1;
                         bbo_bid_px  <= bpx;

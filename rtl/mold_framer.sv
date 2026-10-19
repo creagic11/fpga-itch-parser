@@ -237,11 +237,13 @@ module mold_framer (
 
             unique case (state)
                 S_HDR: begin
-                    for (int k = 0; k < 8; k++) begin
-                        if (5'(k) < take) begin
-                            automatic int j = int'(hdr_got) + k;
-                            if (j >= 10 && j < 18) hdr_seq[8*(17 - j) +: 8] <= buf_q[8*k +: 8];
-                            if (j >= 18 && j < 20) hdr_count[8*(19 - j) +: 8] <= buf_q[8*k +: 8];
+                    // header byte j = hdr_got + k sits in buffer lane k
+                    for (int j = 10; j < 20; j++) begin
+                        for (int k = 0; k < 8; k++) begin
+                            if (5'(k) < take && 5'(j) == hdr_got + 5'(k)) begin
+                                if (j < 18) hdr_seq[8*(17 - j) +: 8]   <= buf_q[8*k +: 8];
+                                else        hdr_count[8*(19 - j) +: 8] <= buf_q[8*k +: 8];
+                            end
                         end
                     end
                     hdr_got <= hdr_got + take;
