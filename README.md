@@ -5,7 +5,7 @@ data (over MoldUDP64) and maintains the best bid and offer of a stock in hardwar
 AXI-Stream at 156.25 MHz (the 10 Gb/s datapath), verified in cocotb against a C++ golden model,
 synthesised and timed in Vivado for an Artix-7.
 
-> Simulation and Vivado implementation only: no board. Timing met at 156.25 MHz on an Artix-7 100T (out of context, Vivado 2024.1); Phase 8 write-up in progress.
+> Simulation and Vivado implementation only: no board. Timing met at 156.25 MHz on an Artix-7 100T (out of context, Vivado 2024.1). Write-up: [docs/writeup.md](docs/writeup.md).
 
 ## Status
 
@@ -19,7 +19,7 @@ synthesised and timed in Vivado for an Artix-7.
 | 5 | Top-of-book engine (BRAM order table, price ladder) | done |
 | 6 | End-to-end verification against the C++ book on real data | done: 1M real messages, 9,295 BBO updates identical to the C++ book; 333 ns wire-to-BBO |
 | 7 | Synthesis and timing closure | done: **156.25 MHz met** on Artix-7 (WNS +0.141 ns, Fmax 159.8 MHz), 16.4k LUTs, 13.4k FFs, 48.5 BRAM, 1 DSP; reports in `syn/reports/` |
-| 8 | Write-up | |
+| 8 | Write-up | done: [docs/writeup.md](docs/writeup.md) (design decisions, timing closure in six runs, verification, limits) |
 
 ## Running
 
