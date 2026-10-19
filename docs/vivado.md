@@ -25,6 +25,7 @@ Vivado 2024.1 on Windows, out-of-context implementation of the whole design
    `itch_book_top_slack_by_module.rpt`.
    Send these five files back (or commit them). The slack-by-module report lists the worst
    path ending in each block (also printed as `== slack` lines), so a failing run shows every
-   block that needs pipelining, not only the worst one.
+   block that needs pipelining, not only the worst one. If any block fails, a sixth file,
+   `itch_book_top_failing_paths.rpt`, holds the full path of each failing block: send it too.
 
 Other tops: `syn\build.bat udp_rx_top` (receiver only), `syn\build.bat book_engine`.

@@ -12,9 +12,14 @@
 //   34-35 src port 36-37 dst port 38-39 UDP len 40-41 UDP checksum  42.. payload
 //
 // All header fields are complete by the end of beat 4, so the accept decision is
-// registered there and beat 5 is forwarded (or dropped) with no extra latency.
+// made there and beat 5 is forwarded (or dropped) with no extra latency.
 // The IPv4 header checksum (ten 16-bit words, ones' complement) is accumulated
-// beat by beat. The payload is trimmed to the UDP length, which also discards
+// beat by beat. Its last word arrives in beat 4, so the checksum verdict is
+// taken one cycle later, while beat 5 is presented (state CHK): in beat 4 the
+// first nine words are folded to 16 bits (f) and the last word (w) is
+// registered; the header is valid iff f + w = 0xFFFF in ones' complement, i.e.
+// w == ~f (or f == w == 0xFFFF). That is a plain comparison, not an adder,
+// so it fits in front of the forwarding logic. The payload is trimmed to the UDP length, which also discards
 // Ethernet minimum-size padding.
 //
 // A frame is accepted only if: EtherType 0x0800, version 4, IHL 5 (no options),
@@ -53,11 +58,14 @@ module eth_ip_udp_rx (
     output logic [31:0] cnt_drop_runt,  // frame ended inside the headers
     output logic [31:0] cnt_truncated   // frame ended before the UDP length
 );
-    typedef enum logic [1:0] {HDR, FWD, DROP} state_t;
+    typedef enum logic [1:0] {HDR, CHK, FWD, DROP} state_t;
     state_t     state;
     logic [2:0] beat;          // beat index within the frame while in HDR (0..4)
     logic       first_fwd;     // next forwarded beat is beat 5 (payload from lane 2)
     logic [15:0] remaining;    // payload bytes still to forward
+    logic        rem_hi0;      // remaining < 16 (so remaining[3:0] is the whole value)
+    logic [15:0] csum_f, csum_w; // folded sum of words 1-9, and word 10 (CHK)
+    logic        dst_bad_q;
 
     // captured header fields
     logic [15:0] ethertype, ip_total_len;
@@ -95,14 +103,14 @@ module eth_ip_udp_rx (
     wire [31:0] dst_ip_b4   = {dst_ip_hi, word(d, 0)};
     wire [15:0] dst_port_b4 = word(d, 4);
     wire [15:0] udp_len_b4  = word(d, 6);
-    wire [15:0] csum_b4     = fold(csum_acc + {4'd0, word(d, 0)});
 
     wire bad_eth  = (ethertype != 16'h0800);
     wire bad_ip   = (ver_ihl != 8'h45) || (proto != 8'd17) ||
                     (ip_mf_frag != 14'd0) ||  /* more-fragments flag or nonzero offset */
                     (udp_len_b4 < 16'd9) || (ip_total_len < 16'd29) ||
                     (udp_len_b4 > ip_total_len - 16'd20);
-    wire bad_csum = (csum_b4 != 16'hFFFF);
+    wire csum_ok  = (csum_w == ~csum_f) || (csum_f == 16'hFFFF && csum_w == 16'hFFFF);
+    wire pass     = csum_ok && !dst_bad_q;    // CHK: forward this frame
     wire bad_dst  = (dst_ip_b4 != cfg_dst_ip) || (dst_port_b4 != cfg_dst_port);
 
     // ---------------------------------------------------------------- forwarding
@@ -110,12 +118,13 @@ module eth_ip_udp_rx (
     wire [3:0]  start      = first_fwd ? 4'd2 : 4'd0;
     wire [3:0]  in_bytes   = s_axis_tlast ? keep_bytes(s_axis_tkeep) : 4'd8;
     wire [3:0]  avail      = (in_bytes > start) ? in_bytes - start : 4'd0;
-    wire        ends_here  = (remaining <= {12'd0, avail});
+    wire        ends_here  = rem_hi0 && (remaining[3:0] <= avail);
     wire [3:0]  n_out      = ends_here ? remaining[3:0] : avail;
     wire [7:0]  out_keep   = 8'((16'(1) << n_out) - 16'(1)) << start;
 
-    assign s_axis_tready  = (state == FWD) ? m_axis_tready : 1'b1;
-    assign m_axis_tvalid  = (state == FWD) && s_axis_tvalid;
+    wire        fwd_now    = (state == FWD) || (state == CHK && pass);
+    assign s_axis_tready  = fwd_now ? m_axis_tready : 1'b1;
+    assign m_axis_tvalid  = fwd_now && s_axis_tvalid;
     assign m_axis_tdata   = s_axis_tdata;
     assign m_axis_tkeep   = out_keep;
     assign m_axis_tlast   = ends_here || s_axis_tlast;
@@ -168,31 +177,41 @@ module eth_ip_udp_rx (
                         end else if (bad_ip) begin
                             cnt_drop_ip <= cnt_drop_ip + 1;
                             state <= DROP;
-                        end else if (bad_csum) begin
-                            cnt_drop_csum <= cnt_drop_csum + 1;
-                            state <= DROP;
-                        end else if (bad_dst) begin
-                            cnt_drop_dst <= cnt_drop_dst + 1;
-                            state <= DROP;
-                        end else begin
-                            cnt_accepted <= cnt_accepted + 1;
+                        end else begin                      // checksum, destination: in CHK
+                            csum_f    <= fold(csum_acc);
+                            csum_w    <= word(d, 0);
+                            dst_bad_q <= bad_dst;
                             remaining <= udp_len_b4 - 16'd8;
+                            rem_hi0   <= (udp_len_b4 < 16'd24);
                             first_fwd <= 1'b1;
-                            state <= FWD;
+                            state <= CHK;
                         end
                     end else begin
                         beat <= beat + 3'd1;
                     end
                 end
 
-                FWD: begin
-                    first_fwd <= 1'b0;
-                    remaining <= remaining - {12'd0, n_out};
-                    if (s_axis_tlast) begin
-                        if (!ends_here) cnt_truncated <= cnt_truncated + 1;
-                        state <= HDR;
-                    end else if (ends_here) begin
-                        state <= DROP;  // discard padding up to the end of the frame
+                CHK, FWD: begin
+                    if (state == CHK && !csum_ok) begin
+                        cnt_drop_csum <= cnt_drop_csum + 1;
+                        state <= s_axis_tlast ? HDR : DROP;
+                    end else if (state == CHK && dst_bad_q) begin
+                        cnt_drop_dst <= cnt_drop_dst + 1;
+                        state <= s_axis_tlast ? HDR : DROP;
+                    end else begin
+                        if (state == CHK) cnt_accepted <= cnt_accepted + 1;
+                        first_fwd <= 1'b0;
+                        remaining <= remaining - {12'd0, n_out};
+                        // next value of rem_hi0 when the payload goes on (n_out = 6 or 8)
+                        rem_hi0   <= first_fwd ? (remaining < 16'd22) : (remaining < 16'd24);
+                        if (s_axis_tlast) begin
+                            if (!ends_here) cnt_truncated <= cnt_truncated + 1;
+                            state <= HDR;
+                        end else if (ends_here) begin
+                            state <= DROP;  // discard padding up to the end of the frame
+                        end else begin
+                            state <= FWD;
+                        end
                     end
                 end
 

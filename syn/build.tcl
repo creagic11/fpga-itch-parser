@@ -35,6 +35,7 @@ write_checkpoint -force [file join $out ${top}_post_route.dcp]
 
 # Worst setup slack ending in each module, so a failing run shows every block
 # that needs work, not only the single worst path.
+file delete -force [file join $rpt ${top}_failing_paths.rpt]
 set fh [open [file join $rpt ${top}_slack_by_module.rpt] w]
 puts $fh [format "%-40s %10s %7s  %s" "module instance" "WNS (ns)" "levels" "worst path start -> end"]
 set all_regs [get_cells -quiet -hier -filter {IS_SEQUENTIAL}]
@@ -52,6 +53,10 @@ foreach inst [lsort [get_cells -hier -filter {IS_PRIMITIVE == 0}]] {
               [get_property LOGIC_LEVELS $p] [get_property STARTPOINT_PIN $p] [get_property ENDPOINT_PIN $p]]
     puts $fh $line
     puts "== slack $line"
+    # full path detail for every failing block
+    if {[get_property SLACK $p] < 0} {
+        report_timing -of_objects $p -file [file join $rpt ${top}_failing_paths.rpt] -append
+    }
 }
 close $fh
 

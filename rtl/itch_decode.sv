@@ -6,6 +6,12 @@
 // arrives. Fixed offsets per type are what make ITCH cheap in hardware: no
 // field search, just a type-indexed mux.
 //
+// Two steps for timing: the last beat is written into the capture register like
+// any other (with the final length, tuser and sequence number), and the message
+// is checked and decoded from registers in the next cycle. While a decoded
+// message waits for the output, input is held, so the next message's first beat
+// cannot overwrite the capture register too early.
+//
 // Layouts (Nasdaq TotalView-ITCH 5.0): header = type(0) locate(1-2) tracking(3-4)
 // timestamp(5-10); then
 //   A/F  ref 11-18  side 19  shares 20-23  stock 24-31  price 32-35  (F: MPID 36-39)
@@ -84,28 +90,29 @@ module itch_decode (
     endfunction
 
     // ---------------------------------------------------------------- capture
-    wire fire      = s_axis_tvalid && s_axis_tready;
-    wire out_free  = !ev_valid || ev_ready;
-    assign s_axis_tready = !s_axis_tlast || out_free;   // only the last beat waits for the output
+    // ---------------------------------------------------------------- capture
+    logic        dv;           // a complete message is in msg, waiting to be decoded
+    logic [15:0] d_len;        // its length
+    logic        d_user;       // flagged upstream
+    logic [63:0] d_seq;
 
-    // Bytes of the message as they will stand once the current beat is stored.
-    logic [8*CAP-1:0] msg_now;
-    always_comb begin
-        msg_now = msg;
-        if (beat < 3'd5) msg_now[64*beat +: 64] = s_axis_tdata;
-    end
+    wire out_free  = !ev_valid || ev_ready;
+    wire dec_go    = dv && out_free;                    // decode step runs this cycle
+    assign s_axis_tready = !dv || out_free;
+    wire fire      = s_axis_tvalid && s_axis_tready;
     wire [15:0] len_now = len + {12'd0, s_axis_tlast ? keep_bytes(s_axis_tkeep) : 4'd8};
 
+    // ---------------------------------------------------------------- decode (registers only)
     function automatic logic [7:0]  b8 (input logic [8*CAP-1:0] m, input int i); return m[8*i +: 8]; endfunction
     function automatic logic [15:0] b16(input logic [8*CAP-1:0] m, input int i); return {b8(m,i), b8(m,i+1)}; endfunction
     function automatic logic [31:0] b32(input logic [8*CAP-1:0] m, input int i); return {b16(m,i), b16(m,i+2)}; endfunction
     function automatic logic [47:0] b48(input logic [8*CAP-1:0] m, input int i); return {b16(m,i), b32(m,i+2)}; endfunction
     function automatic logic [63:0] b64(input logic [8*CAP-1:0] m, input int i); return {b32(m,i), b32(m,i+4)}; endfunction
 
-    wire [7:0]  t        = b8(msg_now, 0);
-    wire [15:0] locate   = b16(msg_now, 1);
+    wire [7:0]  t        = b8(msg, 0);
+    wire [15:0] locate   = b16(msg, 1);
     wire        known    = (itch_len(t) != 6'd0);
-    wire        len_ok   = known && (len_now == {10'd0, itch_len(t)});
+    wire        len_ok   = known && (d_len == {10'd0, itch_len(t)});
     wire        is_book  = (t == "A") || (t == "F") || (t == "E") || (t == "C") ||
                            (t == "X") || (t == "D") || (t == "U") || (t == "P");
     wire        wanted   = !cfg_filter_en || (locate == cfg_locate);
@@ -114,72 +121,84 @@ module itch_decode (
         if (rst) begin
             beat <= '0;
             len <= '0;
+            dv <= 1'b0;
             ev_valid <= 1'b0;
             {cnt_msgs, cnt_events, cnt_other, cnt_filtered, cnt_bad} <= '0;
         end else begin
             if (ev_valid && ev_ready) ev_valid <= 1'b0;
+
+            // capture: every beat goes into msg (first five), the last one ends it
             if (fire) begin
+                for (int i = 0; i < 5; i++) if (beat == 3'(i)) msg[64*i +: 64] <= s_axis_tdata;
                 if (!s_axis_tlast) begin
-                    msg  <= msg_now;
                     len  <= len_now;
                     beat <= (beat < 3'd5) ? beat + 3'd1 : beat;
                 end else begin
-                    beat <= '0;
-                    len  <= '0;
-                    cnt_msgs <= cnt_msgs + 1;
-                    if (s_axis_tuser || !len_ok) begin
-                        cnt_bad <= cnt_bad + 1;
-                    end else if (!is_book) begin
-                        cnt_other <= cnt_other + 1;
-                    end else if (!wanted) begin
-                        cnt_filtered <= cnt_filtered + 1;
-                    end else begin
-                        cnt_events  <= cnt_events + 1;
-                        ev_valid    <= 1'b1;
-                        ev_msg_type <= t;
-                        ev_locate   <= locate;
-                        ev_ts       <= b48(msg_now, 5);
-                        ev_ref      <= b64(msg_now, 11);
-                        ev_seq      <= s_seq;
-                        ev_new_ref  <= '0;
-                        ev_shares   <= '0;
-                        ev_price    <= '0;
-                        ev_side_sell <= 1'b0;
-                        case (t)
-                            "A", "F": begin
-                                ev_type <= 3'd1;
-                                ev_side_sell <= (b8(msg_now, 19) == "S");
-                                ev_shares <= b32(msg_now, 20);
-                                ev_price  <= b32(msg_now, 32);
-                            end
-                            "E": begin
-                                ev_type <= 3'd2;
-                                ev_shares <= b32(msg_now, 19);
-                            end
-                            "C": begin
-                                ev_type <= 3'd3;
-                                ev_shares <= b32(msg_now, 19);
-                                ev_price  <= b32(msg_now, 32);
-                            end
-                            "X": begin
-                                ev_type <= 3'd4;
-                                ev_shares <= b32(msg_now, 19);
-                            end
-                            "D": ev_type <= 3'd5;
-                            "U": begin
-                                ev_type <= 3'd6;
-                                ev_new_ref <= b64(msg_now, 19);
-                                ev_shares  <= b32(msg_now, 27);
-                                ev_price   <= b32(msg_now, 31);
-                            end
-                            default: begin  // "P"
-                                ev_type <= 3'd7;
-                                ev_side_sell <= (b8(msg_now, 19) == "S");
-                                ev_shares <= b32(msg_now, 20);
-                                ev_price  <= b32(msg_now, 32);
-                            end
-                        endcase
-                    end
+                    beat   <= '0;
+                    len    <= '0;
+                    d_len  <= len_now;
+                    d_user <= s_axis_tuser;
+                    d_seq  <= s_seq;
+                end
+            end
+            if (fire && s_axis_tlast) dv <= 1'b1;
+            else if (dec_go)          dv <= 1'b0;
+
+            // decode
+            if (dec_go) begin
+                cnt_msgs <= cnt_msgs + 1;
+                if (d_user || !len_ok) begin
+                    cnt_bad <= cnt_bad + 1;
+                end else if (!is_book) begin
+                    cnt_other <= cnt_other + 1;
+                end else if (!wanted) begin
+                    cnt_filtered <= cnt_filtered + 1;
+                end else begin
+                    cnt_events  <= cnt_events + 1;
+                    ev_valid    <= 1'b1;
+                    ev_msg_type <= t;
+                    ev_locate   <= locate;
+                    ev_ts       <= b48(msg, 5);
+                    ev_ref      <= b64(msg, 11);
+                    ev_seq      <= d_seq;
+                    ev_new_ref  <= '0;
+                    ev_shares   <= '0;
+                    ev_price    <= '0;
+                    ev_side_sell <= 1'b0;
+                    case (t)
+                        "A", "F": begin
+                            ev_type <= 3'd1;
+                            ev_side_sell <= (b8(msg, 19) == "S");
+                            ev_shares <= b32(msg, 20);
+                            ev_price  <= b32(msg, 32);
+                        end
+                        "E": begin
+                            ev_type <= 3'd2;
+                            ev_shares <= b32(msg, 19);
+                        end
+                        "C": begin
+                            ev_type <= 3'd3;
+                            ev_shares <= b32(msg, 19);
+                            ev_price  <= b32(msg, 32);
+                        end
+                        "X": begin
+                            ev_type <= 3'd4;
+                            ev_shares <= b32(msg, 19);
+                        end
+                        "D": ev_type <= 3'd5;
+                        "U": begin
+                            ev_type <= 3'd6;
+                            ev_new_ref <= b64(msg, 19);
+                            ev_shares  <= b32(msg, 27);
+                            ev_price   <= b32(msg, 31);
+                        end
+                        default: begin  // "P"
+                            ev_type <= 3'd7;
+                            ev_side_sell <= (b8(msg, 19) == "S");
+                            ev_shares <= b32(msg, 20);
+                            ev_price  <= b32(msg, 32);
+                        end
+                    endcase
                 end
             end
         end

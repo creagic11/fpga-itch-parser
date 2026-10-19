@@ -116,7 +116,7 @@ module book_engine #(
 
     for (genvar w = 0; w < WAYS; w++) begin : g_way
         logic [$bits(entry_t)-1:0] rd_raw;
-        sdp_ram #(.W($bits(entry_t)), .DEPTH(NSETS), .OREG(1)) u_ram (
+        sdp_ram #(.W($bits(entry_t)), .DEPTH(NSETS), .OREG(1), .IREG(1)) u_ram (
             .clk, .we(way_we[w]),
             .waddr((state == CLEAR) ? clr_addr[SET_BITS-1:0] : e_ref[SET_BITS-1:0]),
             .wdata(way_wd), .raddr(way_raddr), .rdata(rd_raw)
@@ -131,11 +131,11 @@ module book_engine #(
     wire  [WIN_BITS-1:0] lvl_waddr = (state == CLEAR) ? clr_addr[WIN_BITS-1:0] : op_pidx;
     wire  [47:0]         lvl_wd    = (state == CLEAR) ? 48'd0 : lvl_new;
 
-    sdp_ram #(.W(48), .DEPTH(NLVL), .OREG(1)) u_lvl_bid (
+    sdp_ram #(.W(48), .DEPTH(NLVL), .OREG(1), .IREG(1)) u_lvl_bid (
         .clk, .we(lvl_we_bid), .waddr(lvl_waddr), .wdata(lvl_wd),
         .raddr(lvl_raddr_bid), .rdata(lvl_rd_bid)
     );
-    sdp_ram #(.W(48), .DEPTH(NLVL), .OREG(1)) u_lvl_ask (
+    sdp_ram #(.W(48), .DEPTH(NLVL), .OREG(1), .IREG(1)) u_lvl_ask (
         .clk, .we(lvl_we_ask), .waddr(lvl_waddr), .wdata(lvl_wd),
         .raddr(lvl_raddr_ask), .rdata(lvl_rd_ask)
     );
@@ -143,18 +143,44 @@ module book_engine #(
     // ---------------------------------------------------------------- non-empty bitmaps
     logic [NLVL-1:0] bm_bid, bm_ask;
 
-    function automatic logic [5:0] highest(input logic [63:0] v);
-        logic [5:0] r;
+    // Priority encoders over 64 bits, written as a two-level tree (eight groups of
+    // eight bits) so synthesis does not build a 64-deep chain.
+    function automatic logic [2:0] hi8(input logic [7:0] v);
+        logic [2:0] r;
         r = '0;
-        for (int i = 0; i < 64; i++) if (v[i]) r = 6'(i);
+        for (int i = 0; i < 8; i++) if (v[i]) r = 3'(i);
         return r;
+    endfunction
+    function automatic logic [2:0] lo8(input logic [7:0] v);
+        logic [2:0] r;
+        r = '0;
+        for (int i = 7; i >= 0; i--) if (v[i]) r = 3'(i);
+        return r;
+    endfunction
+    function automatic logic [5:0] highest(input logic [63:0] v);
+        logic [7:0] any;
+        logic [2:0] g;
+        for (int i = 0; i < 8; i++) any[i] = |v[8*i +: 8];
+        g = hi8(any);
+        return {g, hi8(v[8*g +: 8])};
     endfunction
     function automatic logic [5:0] lowest(input logic [63:0] v);
-        logic [5:0] r;
-        r = '0;
-        for (int i = 63; i >= 0; i--) if (v[i]) r = 6'(i);
-        return r;
+        logic [7:0] any;
+        logic [2:0] g;
+        for (int i = 0; i < 8; i++) any[i] = |v[8*i +: 8];
+        g = lo8(any);
+        return {g, lo8(v[8*g +: 8])};
     endfunction
+
+    // Bitmap write, split over two cycles so no single step decodes a 12-bit index
+    // into 8,192 flip-flops: in LADD the word and bit enables are decoded into
+    // registers (one-hot, 64 + 64 bits per side) along with the level's new
+    // empty/non-empty flag; in LWR each bitmap bit loads when its word and bit
+    // enables are both set. The flag is computed beside the adder, not after it:
+    // cur + q is non-zero iff either is; cur - q is non-zero iff cur != q.
+    (* max_fanout = 64 *) logic [NW-1:0] bm_word_bid, bm_word_ask;
+    (* max_fanout = 64 *) logic [63:0]   bm_bit;
+    (* max_fanout = 64 *) logic          bm_nz;
 
     // ---------------------------------------------------------------- price index pipeline
     // (price - base) / 100 = (diff x 5243) >> 19, exact for every multiple of 100
@@ -242,13 +268,31 @@ module book_engine #(
 
     assign ev_ready = (state == IDLE);
 
+    always_ff @(posedge clk) begin
+        for (int w = 0; w < NW; w++) begin
+            bm_word_bid[w] <= (state == LADD) && !op_sell && (op_pidx[WIN_BITS-1:6] == (WIN_BITS-6)'(w));
+            bm_word_ask[w] <= (state == LADD) &&  op_sell && (op_pidx[WIN_BITS-1:6] == (WIN_BITS-6)'(w));
+        end
+        for (int b = 0; b < 64; b++) bm_bit[b] <= (op_pidx[5:0] == 6'(b));
+        if (rst) begin
+            bm_bid <= '0;
+            bm_ask <= '0;
+            bm_word_bid <= '0;
+            bm_word_ask <= '0;
+        end else begin
+            for (int w = 0; w < NW; w++)
+                for (int b = 0; b < 64; b++) begin
+                    if (bm_word_bid[w] && bm_bit[b]) bm_bid[64*w + b] <= bm_nz;
+                    if (bm_word_ask[w] && bm_bit[b]) bm_ask[64*w + b] <= bm_nz;
+                end
+        end
+    end
+
     // ---------------------------------------------------------------- state machine
     always_ff @(posedge clk) begin
         if (rst) begin
             state <= CLEAR;
             clr_addr <= '0;
-            bm_bid <= '0;
-            bm_ask <= '0;
             bbo_valid <= 1'b0;
             {last_bid_px, last_ask_px} <= '0;
             {last_bid_qty, last_ask_qty} <= '0;
@@ -340,13 +384,12 @@ module book_engine #(
 
                 LADD: begin
                     lvl_new <= op_add ? lvl_cur + 48'(op_qty) : lvl_cur - 48'(op_qty);
+                    bm_nz   <= op_add ? (lvl_cur != '0 || op_qty != '0) : (lvl_cur != 48'(op_qty));
                     state <= LWR;
                 end
 
                 LWR: begin
                     changed <= 1'b1;
-                    if (op_sell) bm_ask[op_pidx] <= (lvl_new != '0);
-                    else         bm_bid[op_pidx] <= (lvl_new != '0);
                     if (u_add_pending) begin                         // Replace: now the add half
                         u_add_pending <= 1'b0;
                         e_type <= T_ADD;

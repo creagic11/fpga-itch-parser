@@ -11,9 +11,18 @@
 // held (when at most 16 are held, so s_ready is a register function); the parser
 // consumes bytes from the front. Messages may start at any byte offset and a
 // length field may straddle two input beats; the buffer makes that invisible.
-// The 2-byte length and the first 8 message bytes are consumed in the same
-// cycle, so a message costs ceil(len/8) cycles: back-to-back 19-byte Deletes
-// (21 bytes each with the length) run at 7 bytes/cycle against 8 in.
+//
+// Length look-ahead (for timing): how many bytes to consume each cycle must come
+// from registers, because that number steers the 24-byte shifter. A message's
+// body is tracked in registers (bytes left, bytes in the next beat, last beat or
+// not). On a message's last beat its end position is one of those registers, so
+// the next message's 2-byte length is read from that position in the same
+// cycle, consumed together with the tail, and loaded into the body registers:
+// the next message starts on the following cycle with no length step. A message
+// therefore costs ceil(len/8) cycles; back-to-back 19-byte Deletes (21 bytes
+// each with the length) run at 7 bytes/cycle against 8 in. Only the first
+// message of a packet (or one whose length bytes have not arrived yet) takes a
+// separate cycle in S_LEN.
 //
 // Sequencing: the first packet sets the expected sequence. A packet starting
 // beyond it is a gap (counted, with the number of missing messages); messages
@@ -56,7 +65,7 @@ module mold_framer (
 );
     localparam int NB = 24;  // buffer bytes
 
-    typedef enum logic [2:0] {S_HDR, S_SEQ, S_LEN, S_BODY, S_DRAIN} state_t;
+    typedef enum logic [2:0] {S_HDR, S_SEQ, S_SEQ2, S_LEN, S_BODY, S_DRAIN} state_t;
     state_t state;
 
     logic [8*NB-1:0] buf_q;
@@ -72,6 +81,14 @@ module mold_framer (
     logic [15:0]     msgs_left;    // messages still to parse in this packet
     logic [15:0]     drop_left;    // leading duplicate messages to drop
     logic [15:0]     body_left;    // bytes left in the current message
+    logic [3:0]      nb_q;         // bytes of it in the next beat: min(body_left, 8)
+    logic [4:0]      nb2_q;        // nb_q + 2 (tail plus the next length field)
+    logic            last_q;       // body_left <= 8: the next beat ends the message
+    logic            zero_q;       // body_left == 0: empty message
+    // sequence checks of S_SEQ, registered for S_SEQ2
+    logic [63:0]     sq_end, sq_back;
+    logic [31:0]     sq_gap;
+    logic            sq_ahead, sq_behind;
     logic            dropping;     // message in S_BODY is a duplicate
     logic            normal_end;   // S_DRAIN entered after a complete header/messages
     logic            trailing;     // bytes found after the end of a normal packet
@@ -98,6 +115,20 @@ module mold_framer (
     wire [15:0] front_len = {buf_q[7:0], buf_q[15:8]};  // big-endian length at bytes 0-1
     wire [4:0]  hdr_need  = 5'd20 - hdr_got;
     wire        dup_now   = (drop_left != 16'd0);        // message starting in S_LEN is a duplicate
+    logic       last_msg;                                // msgs_left == 1, kept as a register
+
+    // Header bytes taken in S_HDR, from registers only.
+    wire [4:0]  take_hdr0 = (cnt < hdr_need) ? cnt : hdr_need;
+    wire [4:0]  take_hdr  = (take_hdr0 > 5'd8) ? 5'd8 : take_hdr0;
+
+    // Next message's length, read at the end of the current one (bytes nb_q and
+    // nb_q + 1 of the buffer; used only when they are held, cnt >= nb2_q).
+    logic [15:0] next_len;
+    always_comb begin
+        next_len = '0;
+        for (int i = 0; i <= 8; i++)
+            if (nb_q == 4'(i)) next_len = {buf_q[8*i +: 8], buf_q[8*(i + 1) +: 8]};
+    end
 
     logic [4:0]  take;         // bytes consumed from the front this cycle
     logic        emit;         // load the output register
@@ -105,10 +136,9 @@ module mold_framer (
     logic [7:0]  e_keep;
     logic        e_last, e_user;
     logic        msg_done;     // a message (or duplicate) finished this cycle
-    logic        to_body;      // S_LEN -> S_BODY with body_next bytes left
-    logic [15:0] body_next;
+    logic        chain;        // ...and the next message's length was consumed with it
+    logic        load_front;   // S_LEN: load the body registers from front_len
     logic        truncated;    // packet ended inside a message / header / length
-    logic [3:0]  n_body;
 
     always_comb begin
         take = 5'd0;
@@ -118,51 +148,35 @@ module mold_framer (
         e_last = 1'b0;
         e_user = 1'b0;
         msg_done = 1'b0;
-        to_body = 1'b0;
-        body_next = '0;
+        chain = 1'b0;
+        load_front = 1'b0;
         truncated = 1'b0;
-        n_body = 4'd0;
         unique case (state)
             S_HDR: begin
-                take = (cnt < hdr_need) ? cnt : hdr_need;
-                if (take > 5'd8) take = 5'd8;
+                take = take_hdr;
                 truncated = closed && (cnt < hdr_need) && (cnt <= 5'd8);
             end
-            S_SEQ: ;
+            S_SEQ, S_SEQ2: ;
             S_LEN: begin
-                n_body = (front_len > 16'd8) ? 4'd8 : front_len[3:0];
                 if (cnt >= 5'd2) begin
-                    if (front_len == 16'd0) begin
-                        take = 5'd2;                              // empty message
-                        msg_done = 1'b1;
-                    end else if (cnt >= 5'd2 + {1'b0, n_body} && (dup_now || out_free)) begin
-                        take   = 5'd2 + {1'b0, n_body};           // length + first beat together
-                        emit   = !dup_now;
-                        e_data = buf_q[79:16];
-                        e_keep = keep_mask(n_body);
-                        e_last = (front_len <= 16'd8);
-                        msg_done = e_last;
-                        to_body = !e_last;
-                        body_next = front_len - {12'd0, n_body};
-                    end else begin
-                        take = 5'd2;                              // length now, body later
-                        to_body = 1'b1;
-                        body_next = front_len;
-                    end
+                    take = 5'd2;
+                    load_front = 1'b1;
                 end else if (closed) begin
                     take = cnt;
                     truncated = 1'b1;
                 end
             end
             S_BODY: begin
-                n_body = (body_left > 16'd8) ? 4'd8 : body_left[3:0];
-                if (dropping || out_free) begin
-                    if (cnt >= {1'b0, n_body}) begin
-                        take   = {1'b0, n_body};
+                if (zero_q) begin                            // empty message: nothing to send
+                    msg_done = 1'b1;
+                end else if (dropping || out_free) begin
+                    if (cnt >= {1'b0, nb_q}) begin
+                        chain  = last_q && !last_msg && (cnt >= nb2_q);
+                        take   = chain ? nb2_q : {1'b0, nb_q};
                         emit   = !dropping;
-                        e_keep = keep_mask(n_body);
-                        e_last = (body_left <= 16'd8);
-                        msg_done = e_last;
+                        e_keep = keep_mask(nb_q);
+                        e_last = last_q;
+                        msg_done = last_q;
                     end else if (closed) begin               // packet ended inside the message
                         take   = cnt;
                         emit   = !dropping;
@@ -178,17 +192,27 @@ module mold_framer (
         endcase
     end
 
+    // body registers for a message of length L
+    function automatic logic [3:0] nb_of(input logic [15:0] l);
+        return (l > 16'd8) ? 4'd8 : l[3:0];
+    endfunction
+
     // ---------------------------------------------------------------- buffer update
-    wire [4:0]       kept     = cnt - take;
-    wire [8*NB-1:0]  shifted  = buf_q >> (8 * take);
     // Invariant: every buffer byte at or beyond `cnt` is zero, so a new beat can be
     // OR-ed in behind the held bytes. Bytes outside tkeep are don't-care in
     // AXI-Stream (they can carry leftovers), so they are zeroed on the way in.
+    // The beat is placed at byte `cnt` (a register) and the merged buffer is then
+    // shifted by `take` once: the late signal `take` drives one shifter, and
+    // nothing waits for cnt - take. (take <= cnt always, so shifting the merged
+    // buffer equals shifting the old bytes and appending the beat behind them.)
+    wire [4:0]       kept     = cnt - take;
     logic [63:0] in_masked;
     always_comb
         for (int i = 0; i < 8; i++) in_masked[8*i +: 8] = (4'(i) < in_bytes) ? s_axis_tdata[8*i +: 8] : 8'h00;
-    wire [8*NB-1:0]  appended = {{(8*NB-64){1'b0}}, in_masked} << (8 * kept);
-    wire             in_dup   = (state == S_LEN) ? dup_now : dropping;
+    wire [8*NB-1:0]  appended = {{(8*NB-64){1'b0}}, in_fire ? in_masked : 64'd0} << (8 * cnt);
+    wire [8*NB-1:0]  merged   = buf_q | appended;
+    wire [8*NB-1:0]  shifted  = merged >> (8 * take);
+    wire             in_dup   = dropping;
 
     always_ff @(posedge clk) begin
         if (rst) begin
@@ -207,11 +231,12 @@ module mold_framer (
             trailing <= 1'b0;
             drop_left <= '0;
             msgs_left <= '0;
+            last_msg <= 1'b0;
             {cnt_packets, cnt_messages, cnt_heartbeats, cnt_gaps} <= '0;
             {cnt_gap_msgs, cnt_dup_msgs, cnt_errors} <= '0;
         end else begin
             // buffer: consume `take` from the front, append the input beat behind
-            buf_q <= in_fire ? (shifted | appended) : shifted;
+            buf_q <= shifted;
             cnt   <= kept + (in_fire ? {1'b0, in_bytes} : 5'd0);
             if (in_fire && s_axis_tlast) begin
                 closed  <= 1'b1;
@@ -238,6 +263,7 @@ module mold_framer (
                     cnt_messages <= cnt_messages + 1;
                 end
                 msgs_left <= msgs_left - 1;
+                last_msg  <= (msgs_left == 16'd2);
                 cur_seq <= cur_seq + 1;
             end
             if (truncated) cnt_errors <= cnt_errors + 1;
@@ -246,43 +272,50 @@ module mold_framer (
                 S_HDR: begin
                     // header byte j = hdr_got + k sits in buffer lane k
                     for (int j = 10; j < 20; j++) begin
-                        for (int k = 0; k < 8; k++) begin
-                            if (5'(k) < take && 5'(j) == hdr_got + 5'(k)) begin
-                                if (j < 18) hdr_seq[8*(17 - j) +: 8]   <= buf_q[8*k +: 8];
-                                else        hdr_count[8*(19 - j) +: 8] <= buf_q[8*k +: 8];
-                            end
+                        if (5'(j) >= hdr_got && 5'(j) - hdr_got < take_hdr) begin
+                            if (j < 18) hdr_seq[8*(17 - j) +: 8]   <= buf_q[8*(5'(j) - hdr_got) +: 8];
+                            else        hdr_count[8*(19 - j) +: 8] <= buf_q[8*(5'(j) - hdr_got) +: 8];
                         end
                     end
-                    hdr_got <= hdr_got + take;
-                    if (hdr_got + take == 5'd20) state <= S_SEQ;
+                    hdr_got <= hdr_got + take_hdr;
+                    if (cnt >= hdr_need && hdr_need <= 5'd8) state <= S_SEQ;   // = (hdr_got + take_hdr == 20)
                     else if (truncated) begin
                         normal_end <= 1'b0;
                         state <= S_DRAIN;
                     end
                 end
 
-                S_SEQ: begin
+                S_SEQ: begin                                 // 64-bit arithmetic, registered
+                    sq_end    <= hdr_seq + 64'(hdr_count);
+                    sq_back   <= expected_seq - hdr_seq;
+                    sq_gap    <= 32'(hdr_seq - expected_seq);
+                    sq_ahead  <= synced && (hdr_seq > expected_seq);
+                    sq_behind <= synced && (hdr_seq < expected_seq);
+                    state <= S_SEQ2;
+                end
+
+                S_SEQ2: begin
                     cnt_packets <= cnt_packets + 1;
                     if (pkt_err) cnt_errors <= cnt_errors + 1;
                     cur_seq <= hdr_seq;
                     msgs_left <= hdr_count;
+                    last_msg  <= (hdr_count == 16'd1);
                     normal_end <= 1'b1;
                     if (hdr_count == 16'hFFFF) begin
                         end_of_session <= 1'b1;
                         msgs_left <= '0;
                         state <= S_DRAIN;
                     end else begin
-                        if (synced && hdr_seq > expected_seq) begin
+                        if (sq_ahead) begin
                             cnt_gaps <= cnt_gaps + 1;
-                            cnt_gap_msgs <= cnt_gap_msgs + 32'(hdr_seq - expected_seq);
+                            cnt_gap_msgs <= cnt_gap_msgs + sq_gap;
                         end
-                        if (synced && hdr_seq < expected_seq)
-                            drop_left <= (expected_seq - hdr_seq > 64'(hdr_count))
-                                         ? hdr_count : 16'(expected_seq - hdr_seq);
+                        if (sq_behind)
+                            drop_left <= (sq_back > 64'(hdr_count)) ? hdr_count : 16'(sq_back);
                         else
                             drop_left <= '0;
-                        if (!synced || hdr_seq + 64'(hdr_count) > expected_seq)
-                            expected_seq <= hdr_seq + 64'(hdr_count);
+                        if (!synced || sq_end > expected_seq)
+                            expected_seq <= sq_end;
                         synced <= 1'b1;
                         if (hdr_count == 16'd0) begin
                             cnt_heartbeats <= cnt_heartbeats + 1;
@@ -297,12 +330,14 @@ module mold_framer (
                     if (truncated) begin
                         normal_end <= 1'b0;
                         state <= S_DRAIN;
-                    end else if (to_body) begin
-                        body_left <= body_next;
+                    end else if (load_front) begin
+                        body_left <= front_len;
+                        nb_q      <= nb_of(front_len);
+                        nb2_q     <= 5'd2 + {1'b0, nb_of(front_len)};
+                        last_q    <= (front_len <= 16'd8);
+                        zero_q    <= (front_len == 16'd0);
                         dropping  <= dup_now;
                         state <= S_BODY;
-                    end else if (msg_done && msgs_left == 16'd1) begin
-                        state <= S_DRAIN;
                     end
                 end
 
@@ -310,16 +345,26 @@ module mold_framer (
                     if (truncated) begin
                         normal_end <= 1'b0;
                         state <= S_DRAIN;
+                    end else if (chain) begin                // next message starts next cycle
+                        body_left <= next_len;
+                        nb_q      <= nb_of(next_len);
+                        nb2_q     <= 5'd2 + {1'b0, nb_of(next_len)};
+                        last_q    <= (next_len <= 16'd8);
+                        zero_q    <= (next_len == 16'd0);
+                        dropping  <= dropping && (drop_left != 16'd1);
                     end else if (msg_done) begin
-                        state <= (msgs_left == 16'd1) ? S_DRAIN : S_LEN;
-                    end else if (take != 5'd0) begin
-                        body_left <= body_left - {12'd0, n_body};
+                        state <= last_msg ? S_DRAIN : S_LEN;
+                    end else if (take != 5'd0) begin         // a full 8-byte beat of the body
+                        body_left <= body_left - 16'd8;
+                        nb_q      <= (body_left > 16'd16) ? 4'd8 : 4'(body_left - 16'd8);
+                        nb2_q     <= (body_left > 16'd16) ? 5'd10 : 5'(body_left - 16'd6);
+                        last_q    <= (body_left <= 16'd16);
                     end
                 end
 
                 S_DRAIN: begin
                     if (take != 5'd0 && normal_end) trailing <= 1'b1;
-                    if (closed && kept == 5'd0) begin            // whole packet consumed
+                    if (closed) begin            // whole packet consumed (S_DRAIN takes all of cnt)
                         if (trailing || (take != 5'd0 && normal_end)) cnt_errors <= cnt_errors + 1;
                         closed   <= 1'b0;
                         pkt_err  <= 1'b0;
