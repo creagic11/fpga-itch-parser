@@ -107,6 +107,9 @@ async def drops_and_counts_by_reason(dut):
         ("drop_ip", frame(good, flags="MF")),                                    # first fragment
         ("drop_ip", frame(good, frag=100)),                                      # later fragment
         ("drop_ip", bytes(Ether(dst=DST_MAC) / IP(dst=GROUP) / TCP(dport=PORT) / Raw(good))),
+        # UDP length one byte more than the IP payload holds, and a UDP length with no payload
+        ("drop_ip", bytes(Ether(dst=DST_MAC) / IP(dst=GROUP) / UDP(dport=PORT, len=8 + len(good) + 1) / Raw(good))),
+        ("drop_ip", bytes(Ether(dst=DST_MAC) / IP(dst=GROUP) / UDP(dport=PORT, len=8) / Raw(good))),
         ("drop_csum", frame(good, chksum=0x1234)),
         ("drop_dst", frame(good, dst="233.54.12.112")),
         ("drop_dst", frame(good, dport=PORT + 1)),
