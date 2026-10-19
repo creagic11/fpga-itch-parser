@@ -4,6 +4,9 @@
 //             latency, but the data leaves the RAM from a register (about 0.8 ns
 //             clock-to-out instead of ~2.5 ns), so logic after a read gets almost
 //             the whole clock period.
+//   RREG = 1: the read address is registered inside the instance first (+1 cycle
+//             read latency), so one address register per memory sits next to it
+//             instead of one register driving the address pins of every memory.
 //   IREG = 1: write enable, address and data are registered first, so the write
 //             lands one cycle later and the RAM's write inputs come straight from
 //             flip-flops (block RAM data inputs have a long setup time, and the RAM
@@ -17,7 +20,8 @@ module sdp_ram #(
     parameter int W     = 32,
     parameter int DEPTH = 4096,
     parameter int OREG  = 1,
-    parameter int IREG  = 0
+    parameter int IREG  = 0,
+    parameter int RREG  = 0
 ) (
     input  wire                      clk,
     input  wire                      we,
@@ -33,6 +37,13 @@ module sdp_ram #(
     logic [$clog2(DEPTH)-1:0] waddr_i;
     logic [W-1:0]             wdata_i;
 
+    logic [$clog2(DEPTH)-1:0] raddr_i;
+    if (RREG != 0) begin : g_rreg
+        always_ff @(posedge clk) raddr_i <= raddr;
+    end else begin : g_norreg
+        assign raddr_i = raddr;
+    end
+
     if (IREG != 0) begin : g_ireg
         always_ff @(posedge clk) begin
             we_i    <= we;
@@ -47,7 +58,7 @@ module sdp_ram #(
 
     always_ff @(posedge clk) begin
         if (we_i) mem[waddr_i] <= wdata_i;
-        rd_q <= mem[raddr];
+        rd_q <= mem[raddr_i];
     end
 
     if (OREG != 0) begin : g_oreg

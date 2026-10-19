@@ -64,8 +64,11 @@ module eth_ip_udp_rx (
     logic       first_fwd;     // next forwarded beat is beat 5 (payload from lane 2)
     logic [15:0] remaining;    // payload bytes still to forward
     logic        rem_hi0;      // remaining < 16 (so remaining[3:0] is the whole value)
-    logic [15:0] csum_f, csum_w; // folded sum of words 1-9, and word 10 (CHK)
+    logic        csum_ok_q;    // header checksum verdict, registered in beat 4
     logic        dst_bad_q;
+    logic [15:0] ip_len_m20;   // IP total length - 20 (max UDP length), from beat 2
+    logic        ip_bad_pre;   // version/IHL, protocol, fragment, total length: from beat 3
+    logic        eth_bad_pre;
 
     // captured header fields
     logic [15:0] ethertype, ip_total_len;
@@ -104,13 +107,15 @@ module eth_ip_udp_rx (
     wire [15:0] dst_port_b4 = word(d, 4);
     wire [15:0] udp_len_b4  = word(d, 6);
 
-    wire bad_eth  = (ethertype != 16'h0800);
-    wire bad_ip   = (ver_ihl != 8'h45) || (proto != 8'd17) ||
-                    (ip_mf_frag != 14'd0) ||  /* more-fragments flag or nonzero offset */
-                    (udp_len_b4 < 16'd9) || (ip_total_len < 16'd29) ||
-                    (udp_len_b4 > ip_total_len - 16'd20);
-    wire csum_ok  = (csum_w == ~csum_f) || (csum_f == 16'hFFFF && csum_w == 16'hFFFF);
-    wire pass     = csum_ok && !dst_bad_q;    // CHK: forward this frame
+    wire bad_eth  = eth_bad_pre;
+    wire bad_ip   = ip_bad_pre || (udp_len_b4 < 16'd9) || (udp_len_b4 > ip_len_m20);
+    // Checksum: the first nine words folded (f) plus the tenth (w) must be 0xFFFF in
+    // ones' complement, i.e. w == ~f (or f == w == 0xFFFF): a compare, not an adder.
+    wire [15:0] csum_f   = fold(csum_acc);
+    wire [15:0] csum_w   = word(d, 0);
+    wire csum_ok_b4 = (csum_w == ~csum_f) || (csum_f == 16'hFFFF && csum_w == 16'hFFFF);
+    wire csum_ok  = csum_ok_q;
+    wire pass     = csum_ok_q && !dst_bad_q;  // CHK: forward this frame
     wire bad_dst  = (dst_ip_b4 != cfg_dst_ip) || (dst_port_b4 != cfg_dst_port);
 
     // ---------------------------------------------------------------- forwarding
@@ -155,15 +160,26 @@ module eth_ip_udp_rx (
                             ip_total_len  <= word(d, 0);
                             ip_mf_frag    <= {d[37:32], d[47:40]};  // byte 20 bits 5:0, byte 21
                             proto         <= lane(d, 7);
+                            ip_len_m20    <= word(d, 0) - 16'd20;
                             csum_acc <= csum_acc + {4'd0, word(d, 0)} + {4'd0, word(d, 2)}
                                                  + {4'd0, word(d, 4)} + {4'd0, word(d, 6)};
                         end
                         3'd3: begin
                             dst_ip_hi <= word(d, 6);
+                            eth_bad_pre <= (ethertype != 16'h0800);
+                            ip_bad_pre  <= (ver_ihl != 8'h45) || (proto != 8'd17) ||
+                                           (ip_mf_frag != 14'd0) ||  /* more-fragments flag or nonzero offset */
+                                           (ip_total_len < 16'd29);
                             csum_acc <= csum_acc + {4'd0, word(d, 0)} + {4'd0, word(d, 2)}
                                                  + {4'd0, word(d, 4)} + {4'd0, word(d, 6)};
                         end
-                        default: ;  // beat 4: decided below
+                        default: begin  // beat 4: captured for CHK whatever the decision
+                            csum_ok_q <= csum_ok_b4;
+                            dst_bad_q <= bad_dst;
+                            remaining <= udp_len_b4 - 16'd8;
+                            rem_hi0   <= (udp_len_b4 < 16'd24);
+                            first_fwd <= 1'b1;
+                        end
                     endcase
 
                     if (s_axis_tlast) begin                 // ended inside the headers
@@ -178,12 +194,6 @@ module eth_ip_udp_rx (
                             cnt_drop_ip <= cnt_drop_ip + 1;
                             state <= DROP;
                         end else begin                      // checksum, destination: in CHK
-                            csum_f    <= fold(csum_acc);
-                            csum_w    <= word(d, 0);
-                            dst_bad_q <= bad_dst;
-                            remaining <= udp_len_b4 - 16'd8;
-                            rem_hi0   <= (udp_len_b4 < 16'd24);
-                            first_fwd <= 1'b1;
                             state <= CHK;
                         end
                     end else begin

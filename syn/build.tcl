@@ -22,10 +22,16 @@ read_xdc -mode out_of_context [file join $script_dir constraints.xdc]
 synth_design -top $top -part $part -mode out_of_context -flatten_hierarchy rebuilt
 report_utilization    -file [file join $rpt ${top}_synth_utilization.rpt]
 
+# opt_design's block-RAM power optimisation adds enable-gating logic in front of
+# the RAMs (cells named *cooolgate*); it cost 1.2 ns on run 4. Timing first.
+set_power_opt -exclude_cells [get_cells -hier -quiet -filter {PRIMITIVE_TYPE =~ BMEM.*.*}]
 opt_design
-place_design
-phys_opt_design
-route_design
+# Timing-driven directives (slower runs, better results), and a physical
+# optimisation pass after routing as well as after placement.
+place_design    -directive ExtraTimingOpt
+phys_opt_design -directive AggressiveExplore
+route_design    -directive AggressiveExplore
+phys_opt_design -directive AggressiveExplore
 
 report_timing_summary -max_paths 10 -report_unconstrained -file [file join $rpt ${top}_timing_summary.rpt]
 report_timing -sort_by group -max_paths 10 -nworst 1 -file [file join $rpt ${top}_critical_paths.rpt]

@@ -11,7 +11,7 @@ Vivado 2024.1 on Windows, out-of-context implementation of the whole design
    ```
 
    `build.bat` finds Vivado through `C:\Xilinx\Vivado\2024.1\settings64.bat`; edit that line if
-   Vivado is installed elsewhere. Synthesis, placement and routing take about 10–20 minutes.
+   Vivado is installed elsewhere. Synthesis, placement and routing take about 15–40 minutes (timing-driven directives).
 3. The last lines print the result, for example:
 
    ```

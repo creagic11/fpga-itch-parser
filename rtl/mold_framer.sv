@@ -7,9 +7,12 @@
 // Output: one AXI-Stream packet per message, lane 0 aligned, tkeep contiguous,
 //   with m_seq = that message's sequence number, stable for the whole packet.
 //
-// Datapath: a 24-byte buffer. Input beats are appended behind the bytes already
-// held (when at most 16 are held, so s_ready is a register function); the parser
-// consumes bytes from the front. Messages may start at any byte offset and a
+// Datapath: a 32-byte ring buffer. Input bytes are written at the write pointer
+// and the parser consumes from the read pointer, so consuming bytes only moves a
+// pointer; the data never shifts (an earlier version shifted a 24-byte buffer by
+// the number of bytes consumed, and that shifter could not run at 156.25 MHz).
+// Input is accepted while at most 24 bytes are held, so s_ready is a register
+// function. Messages may start at any byte offset and a
 // length field may straddle two input beats; the buffer makes that invisible.
 //
 // Length look-ahead (for timing): how many bytes to consume each cycle must come
@@ -63,13 +66,15 @@ module mold_framer (
     output logic [31:0] cnt_dup_msgs,
     output logic [31:0] cnt_errors
 );
-    localparam int NB = 24;  // buffer bytes
+    localparam int NB = 32;  // ring bytes (power of two)
 
     typedef enum logic [2:0] {S_HDR, S_SEQ, S_SEQ2, S_LEN, S_BODY, S_DRAIN} state_t;
     state_t state;
 
-    logic [8*NB-1:0] buf_q;
-    logic [4:0]      cnt;          // valid bytes in buf_q (front = lane 0)
+    logic [7:0]      ring [NB];
+    logic [4:0]      rd_ptr, wr_ptr;
+    logic [5:0]      cnt;          // bytes held (0..32)
+    logic [7:0]      v [10];       // view: v[j] = ring[rd_ptr + j], the next 10 bytes
     logic            closed;       // the current packet's last beat is in the buffer
     logic            pkt_err;      // upstream flagged this payload as truncated
 
@@ -107,19 +112,22 @@ module mold_framer (
     // ---------------------------------------------------------------- input side
     wire        in_fire  = s_axis_tvalid && s_axis_tready;
     wire [3:0]  in_bytes = s_axis_tlast ? keep_bytes(s_axis_tkeep) : 4'd8;
-    assign s_axis_tready = !closed && (cnt <= 5'd16);
+    assign s_axis_tready = !closed && (cnt <= 6'd24);
+
+    always_comb
+        for (int j = 0; j < 10; j++) v[j] = ring[rd_ptr + 5'(j)];
 
     // ---------------------------------------------------------------- parser (comb)
     wire out_free = !m_axis_tvalid || m_axis_tready;
 
-    wire [15:0] front_len = {buf_q[7:0], buf_q[15:8]};  // big-endian length at bytes 0-1
-    wire [4:0]  hdr_need  = 5'd20 - hdr_got;
+    wire [15:0] front_len = {v[0], v[1]};               // big-endian length at bytes 0-1
+    wire [5:0]  hdr_need  = 6'd20 - {1'b0, hdr_got};
     wire        dup_now   = (drop_left != 16'd0);        // message starting in S_LEN is a duplicate
     logic       last_msg;                                // msgs_left == 1, kept as a register
 
     // Header bytes taken in S_HDR, from registers only.
-    wire [4:0]  take_hdr0 = (cnt < hdr_need) ? cnt : hdr_need;
-    wire [4:0]  take_hdr  = (take_hdr0 > 5'd8) ? 5'd8 : take_hdr0;
+    wire [5:0]  take_hdr0 = (cnt < hdr_need) ? cnt : hdr_need;
+    wire [5:0]  take_hdr  = (take_hdr0 > 6'd8) ? 6'd8 : take_hdr0;
 
     // Next message's length, read at the end of the current one (bytes nb_q and
     // nb_q + 1 of the buffer; used only when they are held, cnt >= nb2_q).
@@ -127,10 +135,10 @@ module mold_framer (
     always_comb begin
         next_len = '0;
         for (int i = 0; i <= 8; i++)
-            if (nb_q == 4'(i)) next_len = {buf_q[8*i +: 8], buf_q[8*(i + 1) +: 8]};
+            if (nb_q == 4'(i)) next_len = {v[i], v[i + 1]};
     end
 
-    logic [4:0]  take;         // bytes consumed from the front this cycle
+    logic [5:0]  take;         // bytes consumed from the front this cycle
     logic        emit;         // load the output register
     logic [63:0] e_data;
     logic [7:0]  e_keep;
@@ -141,9 +149,9 @@ module mold_framer (
     logic        truncated;    // packet ended inside a message / header / length
 
     always_comb begin
-        take = 5'd0;
+        take = 6'd0;
         emit = 1'b0;
-        e_data = buf_q[63:0];
+        e_data = {v[7], v[6], v[5], v[4], v[3], v[2], v[1], v[0]};
         e_keep = 8'hFF;
         e_last = 1'b0;
         e_user = 1'b0;
@@ -154,12 +162,12 @@ module mold_framer (
         unique case (state)
             S_HDR: begin
                 take = take_hdr;
-                truncated = closed && (cnt < hdr_need) && (cnt <= 5'd8);
+                truncated = closed && (cnt < hdr_need) && (cnt <= 6'd8);
             end
             S_SEQ, S_SEQ2: ;
             S_LEN: begin
-                if (cnt >= 5'd2) begin
-                    take = 5'd2;
+                if (cnt >= 6'd2) begin
+                    take = 6'd2;
                     load_front = 1'b1;
                 end else if (closed) begin
                     take = cnt;
@@ -170,9 +178,9 @@ module mold_framer (
                 if (zero_q) begin                            // empty message: nothing to send
                     msg_done = 1'b1;
                 end else if (dropping || out_free) begin
-                    if (cnt >= {1'b0, nb_q}) begin
-                        chain  = last_q && !last_msg && (cnt >= nb2_q);
-                        take   = chain ? nb2_q : {1'b0, nb_q};
+                    if (cnt >= {2'b0, nb_q}) begin
+                        chain  = last_q && !last_msg && (cnt >= {1'b0, nb2_q});
+                        take   = chain ? {1'b0, nb2_q} : {2'b0, nb_q};
                         emit   = !dropping;
                         e_keep = keep_mask(nb_q);
                         e_last = last_q;
@@ -197,27 +205,24 @@ module mold_framer (
         return (l > 16'd8) ? 4'd8 : l[3:0];
     endfunction
 
-    // ---------------------------------------------------------------- buffer update
-    // Invariant: every buffer byte at or beyond `cnt` is zero, so a new beat can be
-    // OR-ed in behind the held bytes. Bytes outside tkeep are don't-care in
-    // AXI-Stream (they can carry leftovers), so they are zeroed on the way in.
-    // The beat is placed at byte `cnt` (a register) and the merged buffer is then
-    // shifted by `take` once: the late signal `take` drives one shifter, and
-    // nothing waits for cnt - take. (take <= cnt always, so shifting the merged
-    // buffer equals shifting the old bytes and appending the beat behind them.)
-    wire [4:0]       kept     = cnt - take;
-    logic [63:0] in_masked;
+    // ---------------------------------------------------------------- ring update
+    // Input byte k goes to ring[wr_ptr + k]; bytes outside tkeep are not written.
+    logic [NB-1:0] ring_we;
+    logic [7:0]    ring_wd [NB];
     always_comb
-        for (int i = 0; i < 8; i++) in_masked[8*i +: 8] = (4'(i) < in_bytes) ? s_axis_tdata[8*i +: 8] : 8'h00;
-    wire [8*NB-1:0]  appended = {{(8*NB-64){1'b0}}, in_fire ? in_masked : 64'd0} << (8 * cnt);
-    wire [8*NB-1:0]  merged   = buf_q | appended;
-    wire [8*NB-1:0]  shifted  = merged >> (8 * take);
+        for (int i = 0; i < NB; i++) begin
+            logic [4:0] k;
+            k = 5'(i) - wr_ptr;                              // which input lane lands here
+            ring_we[i] = in_fire && ({1'b0, k} < {2'b0, in_bytes});
+            ring_wd[i] = s_axis_tdata[8*k[2:0] +: 8];
+        end
     wire             in_dup   = dropping;
 
     always_ff @(posedge clk) begin
         if (rst) begin
             state <= S_HDR;
-            buf_q <= '0;
+            rd_ptr <= '0;
+            wr_ptr <= '0;
             cnt <= '0;
             closed <= 1'b0;
             pkt_err <= 1'b0;
@@ -235,9 +240,11 @@ module mold_framer (
             {cnt_packets, cnt_messages, cnt_heartbeats, cnt_gaps} <= '0;
             {cnt_gap_msgs, cnt_dup_msgs, cnt_errors} <= '0;
         end else begin
-            // buffer: consume `take` from the front, append the input beat behind
-            buf_q <= shifted;
-            cnt   <= kept + (in_fire ? {1'b0, in_bytes} : 5'd0);
+            // ring: consume `take` from the read side, write the input beat
+            for (int i = 0; i < NB; i++) if (ring_we[i]) ring[i] <= ring_wd[i];
+            rd_ptr <= rd_ptr + take[4:0];
+            if (in_fire) wr_ptr <= wr_ptr + {1'b0, in_bytes};
+            cnt    <= cnt - take + (in_fire ? {2'b0, in_bytes} : 6'd0);
             if (in_fire && s_axis_tlast) begin
                 closed  <= 1'b1;
                 pkt_err <= s_axis_tuser;
@@ -272,13 +279,13 @@ module mold_framer (
                 S_HDR: begin
                     // header byte j = hdr_got + k sits in buffer lane k
                     for (int j = 10; j < 20; j++) begin
-                        if (5'(j) >= hdr_got && 5'(j) - hdr_got < take_hdr) begin
-                            if (j < 18) hdr_seq[8*(17 - j) +: 8]   <= buf_q[8*(5'(j) - hdr_got) +: 8];
-                            else        hdr_count[8*(19 - j) +: 8] <= buf_q[8*(5'(j) - hdr_got) +: 8];
+                        if (5'(j) >= hdr_got && {1'b0, 5'(j) - hdr_got} < take_hdr) begin
+                            if (j < 18) hdr_seq[8*(17 - j) +: 8]   <= v[4'(5'(j) - hdr_got) & 4'd7];
+                            else        hdr_count[8*(19 - j) +: 8] <= v[4'(5'(j) - hdr_got) & 4'd7];
                         end
                     end
-                    hdr_got <= hdr_got + take_hdr;
-                    if (cnt >= hdr_need && hdr_need <= 5'd8) state <= S_SEQ;   // = (hdr_got + take_hdr == 20)
+                    hdr_got <= hdr_got + take_hdr[4:0];
+                    if (cnt >= hdr_need && hdr_need <= 6'd8) state <= S_SEQ;   // = (hdr_got + take_hdr == 20)
                     else if (truncated) begin
                         normal_end <= 1'b0;
                         state <= S_DRAIN;
@@ -354,7 +361,7 @@ module mold_framer (
                         dropping  <= dropping && (drop_left != 16'd1);
                     end else if (msg_done) begin
                         state <= last_msg ? S_DRAIN : S_LEN;
-                    end else if (take != 5'd0) begin         // a full 8-byte beat of the body
+                    end else if (take != 6'd0) begin         // a full 8-byte beat of the body
                         body_left <= body_left - 16'd8;
                         nb_q      <= (body_left > 16'd16) ? 4'd8 : 4'(body_left - 16'd8);
                         nb2_q     <= (body_left > 16'd16) ? 5'd10 : 5'(body_left - 16'd6);
@@ -363,9 +370,9 @@ module mold_framer (
                 end
 
                 S_DRAIN: begin
-                    if (take != 5'd0 && normal_end) trailing <= 1'b1;
+                    if (take != 6'd0 && normal_end) trailing <= 1'b1;
                     if (closed) begin            // whole packet consumed (S_DRAIN takes all of cnt)
-                        if (trailing || (take != 5'd0 && normal_end)) cnt_errors <= cnt_errors + 1;
+                        if (trailing || (take != 6'd0 && normal_end)) cnt_errors <= cnt_errors + 1;
                         closed   <= 1'b0;
                         pkt_err  <= 1'b0;
                         hdr_got  <= '0;

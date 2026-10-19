@@ -86,8 +86,8 @@ module book_engine #(
     } entry_t;
 
     typedef enum logic [4:0] {
-        CLEAR, IDLE, RD1, RD2, TAG, DECIDE, APPLY, LV1, LV2, LADD, LWR, URD,
-        B1, B2, B3, B4, B5, B6, B7, B8, OUT
+        CLEAR, IDLE, RD1, RD2, RD3, TAG, DECIDE, APPLY, LV1, LV2, LV3, LADD, LWR, LBM, URD,
+        B1, B2, B3, B4, B5, B6, B7, B7B, B8, OUT
     } state_t;
     state_t state;
 
@@ -116,7 +116,7 @@ module book_engine #(
 
     for (genvar w = 0; w < WAYS; w++) begin : g_way
         logic [$bits(entry_t)-1:0] rd_raw;
-        sdp_ram #(.W($bits(entry_t)), .DEPTH(NSETS), .OREG(1), .IREG(1)) u_ram (
+        sdp_ram #(.W($bits(entry_t)), .DEPTH(NSETS), .OREG(1), .IREG(1), .RREG(1)) u_ram (
             .clk, .we(way_we[w]),
             .waddr((state == CLEAR) ? clr_addr[SET_BITS-1:0] : e_ref[SET_BITS-1:0]),
             .wdata(way_wd), .raddr(way_raddr), .rdata(rd_raw)
@@ -131,11 +131,11 @@ module book_engine #(
     wire  [WIN_BITS-1:0] lvl_waddr = (state == CLEAR) ? clr_addr[WIN_BITS-1:0] : op_pidx;
     wire  [47:0]         lvl_wd    = (state == CLEAR) ? 48'd0 : lvl_new;
 
-    sdp_ram #(.W(48), .DEPTH(NLVL), .OREG(1), .IREG(1)) u_lvl_bid (
+    sdp_ram #(.W(48), .DEPTH(NLVL), .OREG(1), .IREG(1), .RREG(1)) u_lvl_bid (
         .clk, .we(lvl_we_bid), .waddr(lvl_waddr), .wdata(lvl_wd),
         .raddr(lvl_raddr_bid), .rdata(lvl_rd_bid)
     );
-    sdp_ram #(.W(48), .DEPTH(NLVL), .OREG(1), .IREG(1)) u_lvl_ask (
+    sdp_ram #(.W(48), .DEPTH(NLVL), .OREG(1), .IREG(1), .RREG(1)) u_lvl_ask (
         .clk, .we(lvl_we_ask), .waddr(lvl_waddr), .wdata(lvl_wd),
         .raddr(lvl_raddr_ask), .rdata(lvl_rd_ask)
     );
@@ -181,6 +181,7 @@ module book_engine #(
     (* max_fanout = 64 *) logic [NW-1:0] bm_word_bid, bm_word_ask;
     (* max_fanout = 64 *) logic [63:0]   bm_bit;
     (* max_fanout = 64 *) logic          bm_nz;
+    logic                                bm_nz1;    // computed in LADD, one flop
 
     // ---------------------------------------------------------------- price index pipeline
     // (price - base) / 100 = (diff x 5243) >> 19, exact for every multiple of 100
@@ -270,10 +271,11 @@ module book_engine #(
 
     always_ff @(posedge clk) begin
         for (int w = 0; w < NW; w++) begin
-            bm_word_bid[w] <= (state == LADD) && !op_sell && (op_pidx[WIN_BITS-1:6] == (WIN_BITS-6)'(w));
-            bm_word_ask[w] <= (state == LADD) &&  op_sell && (op_pidx[WIN_BITS-1:6] == (WIN_BITS-6)'(w));
+            bm_word_bid[w] <= (state == LWR) && !op_sell && (op_pidx[WIN_BITS-1:6] == (WIN_BITS-6)'(w));
+            bm_word_ask[w] <= (state == LWR) &&  op_sell && (op_pidx[WIN_BITS-1:6] == (WIN_BITS-6)'(w));
         end
         for (int b = 0; b < 64; b++) bm_bit[b] <= (op_pidx[5:0] == 6'(b));
+        bm_nz <= bm_nz1;                                     // fan-out copy, loaded in LWR
         if (rst) begin
             bm_bid <= '0;
             bm_ask <= '0;
@@ -323,8 +325,9 @@ module book_engine #(
                     state <= (ev_type == T_TRADE || ev_type == 3'd0) ? IDLE : RD1;  // trades: no book change
                 end
 
-                RD1: state <= RD2;                                   // set read + multiply
-                RD2: state <= TAG;                                   // set read + quotient
+                RD1: state <= RD2;                                   // set read (address reg) + multiply
+                RD2: state <= RD3;                                   // set read + quotient
+                RD3: state <= TAG;                                   // set read (output reg)
 
                 TAG: begin                                           // set data valid
                     for (int w = 0; w < WAYS; w++) begin
@@ -380,16 +383,21 @@ module book_engine #(
                 end
 
                 LV1: state <= LV2;                                   // level read in flight
-                LV2: state <= LADD;
+                LV2: state <= LV3;
+                LV3: state <= LADD;
 
                 LADD: begin
                     lvl_new <= op_add ? lvl_cur + 48'(op_qty) : lvl_cur - 48'(op_qty);
-                    bm_nz   <= op_add ? (lvl_cur != '0 || op_qty != '0) : (lvl_cur != 48'(op_qty));
+                    bm_nz1  <= op_add ? (lvl_cur != '0 || op_qty != '0) : (lvl_cur != 48'(op_qty));
                     state <= LWR;
                 end
 
-                LWR: begin
+                LWR: begin                                           // level RAM write; bitmap enables
                     changed <= 1'b1;
+                    state <= LBM;
+                end
+
+                LBM: begin                                           // bitmap bit written this cycle
                     if (u_add_pending) begin                         // Replace: now the add half
                         u_add_pending <= 1'b0;
                         e_type <= T_ADD;
@@ -441,7 +449,8 @@ module book_engine #(
                     apx <= has_ask ? cfg_base_price + 32'(ask100) : '0;
                     state <= B7;
                 end
-                B7: state <= B8;                                     // level reads in flight
+                B7: state <= B7B;                                    // level reads in flight
+                B7B: state <= B8;
                 B8: begin
                     bq <= has_bid ? lvl_rd_bid : '0;
                     aq <= has_ask ? lvl_rd_ask : '0;

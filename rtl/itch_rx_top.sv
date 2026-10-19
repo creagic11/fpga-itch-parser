@@ -72,15 +72,23 @@ module itch_rx_top (
     );
 
     // ---- burst buffer (64 beats = 512 bytes)
-    wire [73:0] f_payload;
-    wire        f_valid, f_ready;
+    wire [73:0] f0_payload, f_payload;
+    wire        f0_valid, f0_ready, f_valid, f_ready;
     /* verilator lint_off PINCONNECTEMPTY */
     axis_fifo #(.W(74), .DEPTH(64)) u_fifo (
         .clk, .rst,
         .s_valid(p_valid), .s_ready(p_ready), .s_payload({p_user, p_last, p_keep, p_data}),
-        .m_valid(f_valid), .m_ready(f_ready), .m_payload(f_payload), .level()
+        .m_valid(f0_valid), .m_ready(f0_ready), .m_payload(f0_payload), .level()
     );
     /* verilator lint_on PINCONNECTEMPTY */
+
+    // Register slice after the FIFO: its block RAM drives no logic directly
+    // (block RAM clock-to-out is about 2.5 ns without an output register).
+    axis_skid #(.W(74)) u_fskid (
+        .clk, .rst,
+        .s_valid(f0_valid), .s_ready(f0_ready), .s_payload(f0_payload),
+        .m_valid(f_valid), .m_ready(f_ready), .m_payload(f_payload)
+    );
 
     // ---- messages
     wire [63:0] m_data, m_seq;

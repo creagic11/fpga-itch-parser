@@ -109,13 +109,16 @@ module itch_decode (
     function automatic logic [47:0] b48(input logic [8*CAP-1:0] m, input int i); return {b16(m,i), b32(m,i+2)}; endfunction
     function automatic logic [63:0] b64(input logic [8*CAP-1:0] m, input int i); return {b32(m,i), b32(m,i+4)}; endfunction
 
+    // Message-type facts, registered when the first beat arrives (type at byte 0,
+    // locate at bytes 1-2), so the decode step compares registers only.
+    wire [23:0] d0       = s_axis_tdata[23:0];
+    logic [5:0] tlen_q;        // expected length for this type, 0 = unknown type
+    logic       isbook_q, wanted_q;
     wire [7:0]  t        = b8(msg, 0);
     wire [15:0] locate   = b16(msg, 1);
-    wire        known    = (itch_len(t) != 6'd0);
-    wire        len_ok   = known && (d_len == {10'd0, itch_len(t)});
-    wire        is_book  = (t == "A") || (t == "F") || (t == "E") || (t == "C") ||
-                           (t == "X") || (t == "D") || (t == "U") || (t == "P");
-    wire        wanted   = !cfg_filter_en || (locate == cfg_locate);
+    wire        len_ok   = (tlen_q != 6'd0) && (d_len == {10'd0, tlen_q});
+    wire        is_book  = isbook_q;
+    wire        wanted   = wanted_q;
 
     always_ff @(posedge clk) begin
         if (rst) begin
@@ -128,6 +131,12 @@ module itch_decode (
             if (ev_valid && ev_ready) ev_valid <= 1'b0;
 
             // capture: every beat goes into msg (first five), the last one ends it
+            if (fire && beat == 3'd0) begin
+                tlen_q   <= itch_len(d0[7:0]);
+                isbook_q <= (d0[7:0] == "A") || (d0[7:0] == "F") || (d0[7:0] == "E") || (d0[7:0] == "C") ||
+                            (d0[7:0] == "X") || (d0[7:0] == "D") || (d0[7:0] == "U") || (d0[7:0] == "P");
+                wanted_q <= !cfg_filter_en || ({d0[15:8], d0[23:16]} == cfg_locate);
+            end
             if (fire) begin
                 for (int i = 0; i < 5; i++) if (beat == 3'(i)) msg[64*i +: 64] <= s_axis_tdata;
                 if (!s_axis_tlast) begin
